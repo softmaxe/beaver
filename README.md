@@ -1,11 +1,10 @@
-# rename-subtitles
+# rename-subtitles-tui
 
-A dependency-free local tool for matching subtitle filenames (`.ass`, `.srt`, and more) to the
-corresponding video files (`.mkv`, `.mp4`, and more). It provides both a safe command-line
-workflow and a bilingual local Web workspace.
+A local tool for matching subtitle filenames (`.ass`, `.srt`, and more) to the video files beside
+them (`.mkv`, `.mp4`, and more). It runs as a bilingual terminal interface, with the original
+command-line workflow kept for scripting.
 
-The Web workspace runs only on your computer. It does not upload files or send filename data to a
-remote service.
+Everything happens on your computer. No filename or file content ever leaves it.
 
 ## Requirements
 
@@ -17,64 +16,97 @@ remote service.
 From the repository root:
 
 ```bash
-uv venv
+uv sync
 ```
 
-There are no third-party runtime dependencies.
+The terminal interface depends on [Textual](https://textual.textualize.io/); the matching core and
+the CLI have no third-party dependencies.
 
-## Web workspace
-
-Start the local workspace:
+## Terminal interface
 
 ```bash
-uv run python web_app.py
+uv run rename-subs-tui
 ```
 
-It opens `http://127.0.0.1:8765/` in your browser. Use a different port or keep the browser closed
-at startup when needed:
+Without installing the package:
 
 ```bash
-uv run python web_app.py --port 9000 --no-browser
+uv run python tui_app.py
 ```
-
-Closing the workspace page automatically stops the local server. If the browser or computer is
-terminated abruptly, use `Ctrl+C` in the terminal instead.
 
 ### Three-step workflow
 
-1. Enter or choose a local folder containing videos and subtitle files.
-2. Build a read-only preview and review the suggested source-to-target filenames.
-3. Select the intended operations and confirm the rename in the final dialog.
+1. **Point at a folder.** Type or paste a path, or press `o` to browse. `Enter` starts a preview
+   without leaving the field.
+2. **Read the preview.** It is entirely read-only: a summary line, a checkbox list of proposed
+   renames, and a table of what was skipped and why.
+3. **Tick and apply.** Untick anything you do not want, press `a`, and confirm.
 
-The workspace defaults to Simplified Chinese and can be switched to English from the top-right
-language control. The **Try virtual demo** action provides safe sample data without reading or
-changing local files.
+Changing the directory, the recursive switch, the strict switch, or the match level invalidates the
+preview immediately — apply stays disabled until you preview again.
+
+Press `d` for demo mode, which loads a sample library so you can see the whole workflow without a
+real folder. Demo plans can never be applied.
+
+### Shortcuts
+
+| Key      | Action                                          |
+| -------- | ----------------------------------------------- |
+| `Enter`  | Preview (while the path field has focus)        |
+| `p`      | Preview                                         |
+| `a`      | Apply the ticked renames                        |
+| `d`      | Demo mode                                       |
+| `o`      | Browse for a directory                          |
+| `Space`  | Tick or untick the highlighted rename           |
+| `Ctrl+A` | Tick everything                                 |
+| `Ctrl+R` | Untick everything                               |
+| `l`      | Switch language (简体中文 / English)             |
+| `t`      | Switch theme (dark / light)                     |
+| `?`      | Shortcut list                                   |
+| `q`      | Quit                                            |
+
+Single-letter shortcuts type into the path field while it has focus. Press `Tab` to leave it, or
+use `Enter` to preview from there.
+
+The interface starts in Simplified Chinese with the dark theme. Both choices apply instantly and
+keep whatever preview is already loaded.
+
+### Match level
+
+Instead of a raw threshold, the fuzzy matcher is exposed as three named levels:
+
+| Level        | Threshold | Use when                                       |
+| ------------ | --------- | ---------------------------------------------- |
+| Relaxed      | 0.60      | Naming is messy and you will review each match |
+| Balanced     | 0.72      | Default                                        |
+| Cautious     | 0.84      | You only want near-certain matches             |
+
+Episode-ID matches ignore the threshold entirely.
 
 ### Safety model
 
-- The server binds to `127.0.0.1` only.
-- The browser never uploads local files.
-- The apply endpoint accepts only operation IDs from a server-side preview; it does not accept
-  arbitrary source or target paths.
-- Every selected file is checked again before renaming. If a source or target changed after the
-  preview, the workspace requires a new preview.
-- Web operations never overwrite existing files and do not expose the CLI `--force` behavior.
-
-If the native folder picker is unavailable on your platform, paste the absolute local folder path
-into the input field.
+- The preview never writes. Only the apply step touches the filesystem.
+- Every source and destination is fingerprinted when the preview is built and checked again just
+  before renaming. If anything moved in between, the **entire batch is refused** — no partial
+  application — and you are asked to preview again.
+- Existing files are never overwritten. The terminal interface does not expose the CLI's `--force`.
+- Applying runs on a worker thread, as does scanning, so a large recursive directory never freezes
+  the interface.
 
 ## CLI usage
 
 ### Dry run
 
 ```bash
-uv run python rename_subs.py /path/to/folder --dry-run
+uv run rename-subs /path/to/folder --dry-run
 ```
+
+Or without installing: `uv run python rename_subs.py /path/to/folder --dry-run`.
 
 ### Apply renames
 
 ```bash
-uv run python rename_subs.py /path/to/folder --apply
+uv run rename-subs /path/to/folder --apply
 ```
 
 ### Common options
@@ -83,6 +115,10 @@ uv run python rename_subs.py /path/to/folder --apply
 - `--min-score 0.72`: adjust the fuzzy matching threshold when no episode ID exists
 - `--strict`: skip a subtitle when the exact target filename would collide
 - `--force`: allow overwriting existing files in the CLI only; use with care
+
+The CLI plans and applies in a single pass, so it skips the re-verification step the terminal
+interface performs. Like the TUI, it refuses to overwrite an existing target unless `--force` is
+given.
 
 ## How matching works
 
@@ -93,9 +129,26 @@ uv run python rename_subs.py /path/to/folder --apply
 3. **Collision handling** keeps the original extension, uses a detected language suffix when
    possible, then falls back to a numeric suffix. Strict mode skips collisions instead.
 
+Matching is scoped per directory: a subtitle is only ever matched against videos in its own folder.
+
+## Layout
+
+```
+src/rename_subtitles/
+├── planning.py       # pure matching core, no I/O beyond stat and iteration
+├── applying.py       # two-phase safe execution, shared by both front-ends
+├── presentation.py   # UI-neutral vocabulary: match levels, reason codes, demo data
+├── i18n.py           # bilingual string catalog
+├── cli.py            # argparse front-end
+└── tui/              # Textual front-end
+```
+
 ## Tests and checks
 
 ```bash
 uv run python -m pytest -q
 uv run python -m ruff check .
 ```
+
+The terminal interface is tested end to end through Textual's `Pilot`, against real files in a
+temporary directory.
