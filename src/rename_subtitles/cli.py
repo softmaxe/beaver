@@ -5,6 +5,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from .applying import apply_operations, prepare_operations
 from .planning import (
     SUB_EXTS_DEFAULT,
     VIDEO_EXTS_DEFAULT,
@@ -43,15 +44,6 @@ __all__ = [
 ]
 
 
-def _format_ops(operations: Sequence[RenameOp]) -> str:
-    if not operations:
-        return "No renames planned."
-    return "\n".join(
-        f"- {operation.src.name}  ->  {operation.dst.name}  ({operation.reason})"
-        for operation in operations
-    )
-
-
 def _format_ops_grouped(root: Path, grouped: dict[Path, list[RenameOp]]) -> str:
     if not grouped:
         return "No renames planned."
@@ -77,12 +69,6 @@ def _confirm(prompt: str) -> bool:
     except EOFError:
         return False
     return answer in {"y", "yes"}
-
-
-def _rename_one(src: Path, dst: Path, force: bool) -> None:
-    if force and dst.exists():
-        dst.unlink()
-    src.rename(dst)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -165,17 +151,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Aborted.")
         return 1
 
-    failures: list[str] = []
-    for operation in plan.operations:
-        try:
-            _rename_one(operation.src, operation.dst, force=args.force)
-        except Exception as error:  # noqa: BLE001
-            failures.append(f"{operation.src} -> {operation.dst}: {error}")
+    # The CLI plans and applies in one shot, so there is no window in which the
+    # filesystem could drift: verification is the interactive front-ends' job.
+    result = apply_operations(
+        prepare_operations(plan),
+        root,
+        force=args.force,
+        verify=False,
+    )
 
-    if failures:
+    if result.failed:
         print("Some renames failed:", file=sys.stderr)
-        for failure in failures:
-            print(f"- {failure}", file=sys.stderr)
+        for outcome in result.failed:
+            print(f"- {outcome.source} -> {outcome.target}: {outcome.error}", file=sys.stderr)
         return 1
 
     return 0
