@@ -1,0 +1,24 @@
+[project]
+name = "rename-subtitles"
+version = "0.1.0"
+description = "Rename subtitle files with a safe CLI and local Web workspace."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Your Name" }]
+
+[project.scripts]
+rename-subs = "rename_subtitles.cli:main"
+rename-subs-web = "rename_subtitles.web:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.1",
+]

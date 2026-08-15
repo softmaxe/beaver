@@ -1,0 +1,12 @@
+.claude/RESUME.md
+.claude/worktrees/
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+
