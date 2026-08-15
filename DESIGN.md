@@ -1,8 +1,6 @@
 # Design specification — terminal interface
 
-This document describes how `rename-subtitles-tui` looks and behaves in a terminal. It replaces the
-browser design system that shipped with the previous web workspace; the palette carried over, the
-px-and-shadow vocabulary did not.
+This document describes how `rename-subtitles-tui` looks and behaves in a terminal.
 
 The guiding constraint: a terminal has no shadows, no gradients, no hover states, and a grid of
 character cells instead of pixels. Hierarchy has to come from **position, weight, and a small
@@ -11,36 +9,43 @@ one thing.
 
 ## Palette
 
-Both themes share the same accent hues and swap only the neutral ground. Toggling the theme never
-changes what a colour means.
+The interface is Catppuccin Mocha, one flavour only. There is no theme switch: a second palette
+would double the surface area of "what does this colour mean" for no gain in a tool this small.
 
-| Role         | `subtitle-dark` (default) | `subtitle-light` | Meaning                          |
-| ------------ | ------------------------- | ---------------- | -------------------------------- |
-| `background` | `#181715`                 | `#faf9f5`        | The page floor                   |
-| `surface`    | `#1f1e1b`                 | `#efe9de`        | Setup column, result panes       |
-| `panel`      | `#252320`                 | `#f5f0e8`        | Modal dialogs, dividers          |
-| `foreground` | `#faf9f5`                 | `#141413`        | Body text                        |
-| `primary`    | `#cc785c`                 | `#cc785c`        | The primary action, focus, keys  |
-| `secondary`  | `#a9583e`                 | `#a9583e`        | Pressed and deep primary states  |
-| `accent`     | `#5db8a6`                 | `#5db8a6`        | Episode-ID matches, headings     |
-| `success`    | `#5db872`                 | `#5db872`        | Apply button, completed runs     |
-| `warning`    | `#d4a017`                 | `#d4a017`        | Reserved for degraded states     |
-| `error`      | `#c64545`                 | `#c64545`        | Errors, refused applies          |
+| Role                   | Mocha        | Hex       | Meaning                                    |
+| ---------------------- | ------------ | --------- | ------------------------------------------ |
+| `BACKGROUND`           | Base         | `#1e1e2e` | The page floor                             |
+| `SURFACE`              | Mantle       | `#181825` | Setup column, result panes                 |
+| `PANEL`                | Crust        | `#11111b` | Modal dialogs, header and footer bars      |
+| `SELECTION_BACKGROUND` | Surface 0    | `#313244` | The row the cursor is on                   |
+| `BORDER`               | Surface 1    | `#45475a` | Resting borders                            |
+| `FAINT`                | Overlay 1    | `#7f849c` | Fuzzy scores, hints, disabled controls     |
+| `MUTED`                | Subtext 0    | `#a6adc8` | Secondary text, the detail line            |
+| `FOREGROUND`           | Text         | `#cdd6f4` | Body text                                  |
+| `FOCUS`                | Mauve        | `#cba6f7` | The control the keyboard is on             |
+| `HEADING`              | Lavender     | `#b4befe` | Section headings                           |
+| `KEY`                  | Blue         | `#89b4fa` | Keyboard shortcuts, wherever printed       |
+| `CERTAIN`              | Teal         | `#94e2d5` | Episode-ID matches                         |
+| `SUCCESS` / `TICK`     | Green        | `#a6e3a1` | Ticked boxes, the apply button, completion |
+| `WORKING`              | Yellow       | `#f9e2af` | Scanning, and a stale preview              |
+| `DEMO`                 | Peach        | `#fab387` | Demo mode, which looks real but writes nothing |
+| `ERROR`                | Red          | `#f38ba8` | Errors, refused applies                    |
 
-The warm clay `#cc785c` and the teal `#5db8a6` are the two colours a user actually learns:
-**clay means "this is the thing to press", teal means "this match is certain."**
+Mauve and teal are the two colours a user actually learns: **mauve means "this is what the keyboard
+is on", teal means "this match is certain."** Green is reserved for the affirmative — a ticked box,
+the apply button, a finished run — so the one destructive-looking step in the tool reads as safe
+before you press it.
+
+`tui/theme.rs` names every colour for its role rather than its hue, and nothing outside that file
+refers to a hex value. Swapping to another Catppuccin flavour would be an edit to one table.
 
 ### Terminal capability degradation
 
-| Terminal     | Result                                                                   |
-| ------------ | ------------------------------------------------------------------------ |
-| Truecolor    | The palette as specified.                                                |
-| 256 colour   | Textual quantises to the nearest xterm-256 entry. The clay/teal split survives; the three near-black greys of the dark theme flatten toward each other, so the panel-vs-surface separation reads mainly through borders. |
-| 16 colour    | Only the semantic roles survive. This is why nothing in the interface depends on colour alone — every state also carries text (`已跳过`, `预览完成`, the error line), and the match badge is a word, not a dot. |
-
-Nothing is ever encoded in colour alone. `app.tcss` references only theme variables
-(`$primary`, `$surface`, `$text-muted`, …), never literal hex, so a theme switch is a variable
-swap with no stylesheet reload.
+| Terminal     | Result                                                                    |
+| ------------ | ------------------------------------------------------------------------- |
+| Truecolor    | The palette as specified.                                                 |
+| 256 colour   | Crossterm quantises to the nearest xterm-256 entry. The mauve/teal split survives; Base, Mantle and Crust flatten toward each other, so the panel-vs-surface separation reads mainly through borders. |
+| 16 colour    | Only the semantic roles survive. This is why nothing depends on colour alone — every state also carries text (the status line, the `Skipped` tab), and a match badge is a word, not a dot. |
 
 ## Layout
 
@@ -49,113 +54,89 @@ Measured in character cells, not pixels.
 ### Wide (≥ 100 columns)
 
 ```
-┌ Header ─────────────────────────────────────────────────────────────┐
-│ 40 cells             │ remaining width                              │
-│  Setup               │  Summary line                                │
-│  ├ directory input   │  ┌ Tabs ────────────────────────────────┐    │
-│  ├ browse            │  │ To rename (N) │ Skipped (N)          │    │
-│  ├ recursive switch  │  │  SelectionList — checkbox per rename │    │
-│  ├ strict switch     │  │  DataTable    — source | reason      │    │
-│  ├ match level       │  └──────────────────────────────────────┘    │
-│  ├ preview           │  Detail line (full path of the highlight)    │
-│  ├ apply             │  Status line                                 │
-│  └ demo              │                                              │
+┌ Header: title · subtitle ───────────────────────────────────────────┐
+│ 38 cells             │ remaining width                              │
+│ ╭ Setup ───────────╮ │  Summary line                                │
+│ │ directory input  │ │ ╭ To rename (N) │ Skipped (N) ───────────╮   │
+│ │ browse hint      │ │ │  [✓] source → target          badge    │   │
+│ │ subfolder switch │ │ │  Source | Reason                       │   │
+│ │ strict switch    │ │ ╰────────────────────────────────────────╯   │
+│ │ match level ×3   │ │  Detail line (the highlighted row, in full)  │
+│ │ preview / apply  │ │  Status line                                 │
+│ │ demo             │ │                                              │
+│ ╰──────────────────╯ │                                              │
 └ Footer: shortcuts ──────────────────────────────────────────────────┘
 ```
 
-The 40-cell setup column is fixed. Everything the user configures lives on the left, everything
+The 38-cell setup column is fixed. Everything the user configures lives on the left, everything
 the tool reports lives on the right; that split is what makes the three-step workflow legible
 without any step numbering.
 
 ### Narrow (< 100 columns)
 
-Below 100 columns the two panes cannot sit side by side, so `HORIZONTAL_BREAKPOINTS` puts a
-`-narrow` class on the screen and the panes stack vertically. Setup takes at most 45% of the
-height and scrolls internally; results take the rest with a floor of 8 rows. The smallest
-supported size is **80 × 24**, where setup gets 9 rows and results get 13.
+Below 100 columns the two panes cannot sit side by side, so they stack. Setup takes at most 45% of
+the height and scrolls internally — the scroll offset is derived from which control holds the
+keyboard, so the focused row is always on screen — and the results take the rest, with a floor of
+five rows. The smallest supported size is **80 × 24**.
 
-## Component mapping
+## Components
 
-Each web component was replaced by the terminal control with the closest semantics, not the
-closest appearance.
+Every control is drawn from scratch rather than pulled from a widget set, because each one only has
+to do one job:
 
-| Web workspace                      | Terminal                                    | Why                                                                 |
-| ---------------------------------- | ------------------------------------------- | ------------------------------------------------------------------- |
-| Directory text field               | `Input`                                     | Direct equivalent.                                                    |
-| Native folder picker (osascript / tkinter) | `DirectoryTree` in a `ModalScreen`  | No platform branches, no subprocess, no optional GUI dependency.      |
-| Two toggle switches                | `Switch` × 2                                | Direct equivalent.                                                    |
-| Three named match-level radios     | `RadioSet` + 3 `RadioButton`                | Keeps the decision to name the levels rather than expose a threshold. |
-| Operations table with checkboxes   | `SelectionList`                             | Ticking is the semantic core of step 3; `SelectionList` provides it natively rather than simulating a checkbox column in a `DataTable`. |
-| Skipped table                      | `DataTable`                                 | Read-only tabular data with no selection semantics.                   |
-| Confirm `<dialog>`                 | `ConfirmApplyScreen(ModalScreen[bool])`     | Direct equivalent.                                                    |
-| Summary cards                      | One summary line                            | Four numbers do not need four boxes in a terminal.                    |
-| `aria-live` status region          | Status line + `Footer`                      | The status line is the single place "what just happened" is reported. |
+| Element             | Drawn as                                        | Why                                                                 |
+| ------------------- | ----------------------------------------------- | ------------------------------------------------------------------- |
+| Directory field     | One line with its own background and a real terminal cursor | A path scrolls horizontally instead of wrapping; the cursor is the system's, so it blinks like every other prompt. |
+| Folder browser      | A modal list of subdirectories                  | No platform branches, no subprocess, no optional GUI dependency.      |
+| Two switches        | `[✓] label` rows                                | A checkbox is the shape of a boolean.                                 |
+| Three match levels  | `(●) label` rows                                | Named levels rather than an exposed threshold.                        |
+| Proposed renames    | `ratatui::List` with a `[✓]` per row            | Ticking is the semantic core of step 3.                               |
+| Skipped subtitles   | `ratatui::Table`, source and reason             | Read-only tabular data with no selection semantics.                   |
+| Confirmation        | A modal that spells out five examples           | The last stop before anything on disk is touched.                     |
+| Summary             | One line of counts                              | Four numbers do not need four boxes in a terminal.                    |
+| Buttons             | Full-width filled bars, keyed `p` / `a` / `d`   | The key that triggers them is printed on them, so the footer is a reminder rather than the only route. |
+
+Focus is shown one way and one way only: the focused row takes `SELECTION_BACKGROUND` and its label
+goes bold, and the results pane's border turns mauve when the list holds the keyboard.
 
 ### Match badges
 
-A matched row reads `source → target  badge`:
+A matched row reads `[✓] source → target  badge`, with the badge pushed to the right edge:
 
-- **Episode match** — badge in `$accent` (teal). The match is derived from an `SxxEyy` identifier
-  and is effectively certain.
-- **Fuzzy match** — badge in `$text-muted`, showing the score. Deliberately quieter: it is the
-  match a user should actually look at.
+- **Episode match** — badge in teal. The match is derived from an `SxxEyy` identifier and is
+  effectively certain.
+- **Fuzzy match** — badge in `FAINT`, showing the score. Deliberately quieter: it is the match a
+  user should actually look at.
+
+Long paths are trimmed from the left, keeping the filename, because that is the end that identifies
+the file. The detail line under the list always spells the highlighted row out in full.
 
 ## Interaction rules
 
 - **The preview never writes.** Only apply touches the filesystem.
-- **A changed option invalidates the preview** the moment it changes — directory, recursive,
-  strict, or match level. The apply button greys out and the status line says why. This mirrors
-  the web version's `invalidatePreview()`.
-- **The selected count lives in the summary bar, not the status line.** The status line is
-  reserved for what just happened, so ticking a box can never overwrite an error message.
-- **The detail line always describes the highlighted row** in full, because list prompts elide
-  long paths.
-- **Long work runs on a worker thread.** Scanning and applying both do; the results pane shows
-  Textual's loading overlay while a scan is in flight, and `exclusive=True` means a new preview
-  cancels the previous one.
+- **A changed option invalidates the preview** the moment it changes — directory, subfolders,
+  strict, or match level. The apply button greys out and the status line says why.
+- **The ticked count lives in the summary bar, not the status line.** The status line is reserved
+  for what just happened, so ticking a box can never overwrite an error message.
+- **Long work runs on a worker thread.** Scanning and applying both do, reporting back through a
+  channel. Each scan carries a generation number, so a superseded result is discarded rather than
+  overwriting a newer preview.
+- **The whole batch or nothing.** Every path is fingerprinted when the preview is built and checked
+  again immediately before renaming; any drift refuses the entire apply.
 
 ## Keyboard
 
 The full table lives in `README.md` and in the `?` modal. Two rules govern it:
 
 - Single-letter keys for the workflow verbs (`p`, `a`, `d`, `o`), `Ctrl`-modified for the bulk
-  selection operations, and `l` / `t` / `?` / `q` for the interface itself.
-- Single-letter keys necessarily type into a focused `Input`. Rather than fight that with
-  `priority` bindings — which would make paths untypeable — `Enter` submits the path field, and
-  focus moves to the results list after a successful preview so the verbs work immediately.
+  selection operations, and `?` / `q` for the interface itself.
+- Single-letter keys necessarily type into a focused text field. Rather than fight that with
+  priority bindings — which would make paths untypeable — `Enter` submits the path field, `Esc`
+  leaves it, and focus moves to the results list after a successful preview so the verbs work
+  immediately.
 
-## Internationalisation
+## Language
 
-`i18n.py` holds one flat catalog per language. Keys are dot-namespaced by where they appear:
-
-| Namespace  | Covers                                                    |
-| ---------- | --------------------------------------------------------- |
-| `app.*`    | Title and subtitle                                        |
-| `setup.*`  | Everything in the left column, including the level hints   |
-| `action.*` | Button labels and footer binding descriptions              |
-| `summary.*`, `tab.*`, `table.*` | Result headings and counts               |
-| `match.*`  | The two match badges                                       |
-| `skip.*`   | The five skip reason codes from `presentation.py`          |
-| `status.*` | Resting workflow states                                    |
-| `error.*`  | Everything that goes red                                   |
-| `confirm.*`, `picker.*`, `help.*` | Modal contents                          |
-| `result.*` | Apply outcomes                                             |
-
-Rules enforced by `tests/test_i18n.py`: both languages define exactly the same keys, no value is
-blank, every key is namespaced, and `{placeholders}` agree across languages. A missing key renders
-as the key itself rather than raising, so a gap is visible instead of fatal.
-
-Switching language retranslates every label, the tab titles, the list prompts, and the footer
-binding descriptions in place — the loaded preview and the user's ticks both survive.
-
-## What was dropped from the browser design
-
-Shadows, gradients, `backdrop-filter`, hover states, transitions and reduced-motion handling,
-px spacing scales, responsive breakpoints in pixels, web fonts and the whole typographic voice
-(a terminal has one font, chosen by the user), the radial-spike brand mark, and the marketing
-copy that made up most of the web version's translation keys. None of it has a terminal analogue,
-and simulating any of it would fight the medium.
-
-What survived is the part that was never about the browser: the palette, the warm-neutral ground,
-the discipline of one accent colour with one meaning, and the generous whitespace — expressed here
-as blank rows and a 40-cell gutter rather than padding values.
+English only. The previous version carried a bilingual catalog and a language toggle; a single
+voice is one less thing to keep in sync between the two front-ends, and every string now lives
+beside the code that shows it.

@@ -1,0 +1,713 @@
+//! State and behaviour of the terminal interface.
+//!
+//! The shape of the screen mirrors the shape of the task: point at a directory,
+//! read a preview that touches nothing, then tick off the renames you actually
+//! want. Only the apply step writes, and it re-checks the filesystem first.
+//!
+//! Scanning and applying both run on a worker thread and report back through a
+//! channel, so a large recursive directory never freezes the interface.
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::widgets::{ListState, TableState};
+
+use crate::applying::{
+    apply_operations, prepare_operations, ApplyResult, ApplyStatus, PlanChanged, PreparedOperation,
+};
+use crate::paths::display_path;
+use crate::planning::{plan_directory, PlanOptions, RenamePlan};
+use crate::presentation::{demo_plan, MatchLevel};
+use crate::tui::input::TextInput;
+use crate::tui::picker::Picker;
+
+/// How many renames the confirmation dialog spells out before summarising.
+const CONFIRM_EXAMPLE_LIMIT: usize = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Directory,
+    Recursive,
+    Strict,
+    Level,
+    Results,
+}
+
+impl Focus {
+    const ORDER: [Self; 5] = [
+        Self::Directory,
+        Self::Recursive,
+        Self::Strict,
+        Self::Level,
+        Self::Results,
+    ];
+
+    fn step(self, delta: isize) -> Self {
+        let count = Self::ORDER.len() as isize;
+        let current = Self::ORDER
+            .iter()
+            .position(|item| *item == self)
+            .unwrap_or(0) as isize;
+        Self::ORDER[(current + delta).rem_euclid(count) as usize]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Matched,
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusKind {
+    Ready,
+    Working,
+    Success,
+    Demo,
+    Error,
+}
+
+pub struct Status {
+    pub text: String,
+    pub kind: StatusKind,
+}
+
+impl Status {
+    fn new(text: impl Into<String>, kind: StatusKind) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+        }
+    }
+}
+
+/// A preview: a plan, the checkboxes over it, and whether it still describes disk.
+pub struct Preview {
+    pub plan: RenamePlan,
+    pub prepared: Vec<PreparedOperation>,
+    pub ticked: Vec<bool>,
+    pub matched_state: ListState,
+    pub skipped_state: TableState,
+    pub is_demo: bool,
+    /// Set when an option changed, or when the files moved under the preview.
+    pub stale: bool,
+}
+
+impl Preview {
+    fn new(plan: RenamePlan, is_demo: bool) -> Self {
+        let prepared = prepare_operations(&plan);
+        let mut matched_state = ListState::default();
+        if !prepared.is_empty() {
+            matched_state.select(Some(0));
+        }
+        let mut skipped_state = TableState::default();
+        if !plan.skipped.is_empty() {
+            skipped_state.select(Some(0));
+        }
+        Self {
+            ticked: vec![true; prepared.len()],
+            prepared,
+            plan,
+            matched_state,
+            skipped_state,
+            is_demo,
+            stale: false,
+        }
+    }
+
+    pub fn ticked_count(&self) -> usize {
+        self.ticked.iter().filter(|ticked| **ticked).count()
+    }
+
+    fn chosen(&self) -> Vec<PreparedOperation> {
+        self.prepared
+            .iter()
+            .zip(&self.ticked)
+            .filter(|(_, ticked)| **ticked)
+            .map(|(prepared, _)| prepared.clone())
+            .collect()
+    }
+}
+
+pub enum Modal {
+    Help,
+    Confirm { count: usize, examples: Vec<String> },
+    Picker(Picker),
+}
+
+/// A finished piece of background work.
+enum Update {
+    Scanned {
+        generation: u64,
+        result: Result<RenamePlan, String>,
+    },
+    Applied(Result<ApplyResult, PlanChanged>),
+}
+
+pub struct App {
+    pub directory: TextInput,
+    pub recursive: bool,
+    pub strict: bool,
+    pub level: MatchLevel,
+    pub focus: Focus,
+    pub tab: Tab,
+    pub preview: Option<Preview>,
+    pub modal: Option<Modal>,
+    pub status: Status,
+    pub scanning: bool,
+    pub applying: bool,
+    /// Advances while work is in flight, to animate the busy indicator.
+    pub ticks: usize,
+    pub should_quit: bool,
+    /// Rejects results from a scan that a newer scan has already replaced.
+    generation: u64,
+    sender: Sender<Update>,
+    receiver: Receiver<Update>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        let (sender, receiver) = channel();
+        Self {
+            directory: TextInput::default(),
+            recursive: false,
+            strict: false,
+            level: MatchLevel::default(),
+            focus: Focus::Directory,
+            tab: Tab::Matched,
+            preview: None,
+            modal: None,
+            status: Status::new(
+                "Type a directory path, then press Enter to preview",
+                StatusKind::Ready,
+            ),
+            scanning: false,
+            applying: false,
+            ticks: 0,
+            should_quit: false,
+            generation: 0,
+            sender,
+            receiver,
+        }
+    }
+
+    /// Start with a directory already filled in, as the command line may supply.
+    pub fn with_directory(mut self, directory: &Path) -> Self {
+        self.directory.set_value(&directory.to_string_lossy());
+        self
+    }
+
+    pub fn busy(&self) -> bool {
+        self.scanning || self.applying
+    }
+
+    /// Whether the apply step is available right now.
+    pub fn can_apply(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| !preview.is_demo && !preview.stale && preview.ticked_count() > 0)
+            && !self.busy()
+    }
+
+    // --------------------------------------------------------------- worker results
+
+    /// Drain anything the worker threads have reported since the last frame.
+    pub fn poll_workers(&mut self) {
+        while let Ok(update) = self.receiver.try_recv() {
+            match update {
+                Update::Scanned { generation, result } => {
+                    // A newer scan has started; this answer is about a question
+                    // nobody is asking any more.
+                    if generation != self.generation {
+                        continue;
+                    }
+                    self.scanning = false;
+                    match result {
+                        Ok(plan) => self.scan_succeeded(plan),
+                        Err(error) => {
+                            self.status =
+                                Status::new(format!("Scan failed: {error}"), StatusKind::Error);
+                        }
+                    }
+                }
+                Update::Applied(result) => {
+                    self.applying = false;
+                    match result {
+                        Ok(result) => self.apply_finished(&result),
+                        Err(changed) => {
+                            self.mark_stale();
+                            self.status = Status::new(
+                                format!("Files changed on disk — preview again: {changed}"),
+                                StatusKind::Error,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn scan_succeeded(&mut self, plan: RenamePlan) {
+        let (videos, subtitles) = (plan.video_count, plan.subtitle_count);
+        self.preview = Some(Preview::new(plan, false));
+        self.tab = Tab::Matched;
+        self.status = if videos == 0 {
+            Status::new("No video files in this directory", StatusKind::Error)
+        } else if subtitles == 0 {
+            Status::new("No subtitle files in this directory", StatusKind::Error)
+        } else {
+            Status::new(
+                "Preview ready — tick items, then press a to apply",
+                StatusKind::Success,
+            )
+        };
+        // Move off the path field so the single-letter shortcuts work at once.
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| !preview.prepared.is_empty())
+        {
+            self.focus = Focus::Results;
+        }
+    }
+
+    fn apply_finished(&mut self, result: &ApplyResult) {
+        // The files just moved, so the preview no longer describes what is on disk.
+        self.mark_stale();
+        let applied = result.applied.len();
+        let failed = result.failed.len();
+        self.status = match result.status() {
+            ApplyStatus::Completed => Status::new(
+                format!("Renamed {applied} {}", plural(applied, "file", "files")),
+                StatusKind::Success,
+            ),
+            ApplyStatus::Partial => Status::new(
+                format!(
+                    "Renamed {applied}, {failed} failed: {}",
+                    first_error(result)
+                ),
+                StatusKind::Error,
+            ),
+            ApplyStatus::Failed => Status::new(
+                format!("{failed} renames failed: {}", first_error(result)),
+                StatusKind::Error,
+            ),
+        };
+    }
+
+    fn mark_stale(&mut self) {
+        if let Some(preview) = self.preview.as_mut() {
+            preview.stale = true;
+        }
+    }
+
+    // ---------------------------------------------------------------------- actions
+
+    /// A preview only describes the options it was generated from.
+    fn invalidate_preview(&mut self) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        if preview.stale {
+            return;
+        }
+        preview.stale = true;
+        self.status = Status::new("Options changed — preview again", StatusKind::Working);
+    }
+
+    pub fn action_preview(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let raw = self.directory.value();
+        let raw = raw.trim();
+        if raw.is_empty() {
+            self.status = Status::new("Enter a directory path first", StatusKind::Error);
+            return;
+        }
+        let directory = crate::paths::resolve(Path::new(raw));
+        if !directory.is_dir() {
+            self.status = Status::new(format!("Not a directory: {raw}"), StatusKind::Error);
+            return;
+        }
+
+        self.generation += 1;
+        self.scanning = true;
+        self.status = Status::new("Scanning…", StatusKind::Working);
+
+        let generation = self.generation;
+        let sender = self.sender.clone();
+        let options = self.plan_options();
+        thread::spawn(move || {
+            let result = plan_directory(&directory, &options).map_err(|error| error.to_string());
+            let _ = sender.send(Update::Scanned { generation, result });
+        });
+    }
+
+    pub fn action_demo(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.preview = Some(Preview::new(demo_plan(), true));
+        self.tab = Tab::Matched;
+        self.focus = Focus::Results;
+        self.status = Status::new(
+            "Demo mode: sample data, nothing is written",
+            StatusKind::Demo,
+        );
+    }
+
+    pub fn action_apply(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(preview) = self.preview.as_ref() else {
+            self.status = Status::new("Nothing to apply — preview first", StatusKind::Error);
+            return;
+        };
+        if preview.is_demo {
+            self.status = Status::new("Demo mode never writes to disk", StatusKind::Error);
+            return;
+        }
+        if preview.stale {
+            self.status = Status::new("Options changed — preview again", StatusKind::Error);
+            return;
+        }
+        let chosen = preview.chosen();
+        if chosen.is_empty() {
+            self.status = Status::new("Tick at least one subtitle", StatusKind::Error);
+            return;
+        }
+
+        let root = preview.plan.root.clone();
+        let examples = chosen
+            .iter()
+            .take(CONFIRM_EXAMPLE_LIMIT)
+            .map(|prepared| {
+                format!(
+                    "{}  →  {}",
+                    display_path(prepared.source(), &root),
+                    file_name(prepared.destination())
+                )
+            })
+            .collect();
+        self.modal = Some(Modal::Confirm {
+            count: chosen.len(),
+            examples,
+        });
+    }
+
+    fn start_apply(&mut self) {
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        let chosen = preview.chosen();
+        if chosen.is_empty() {
+            return;
+        }
+        let root = preview.plan.root.clone();
+        self.applying = true;
+        self.status = Status::new("Applying…", StatusKind::Working);
+
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = apply_operations(&chosen, &root, false, true);
+            let _ = sender.send(Update::Applied(result));
+        });
+    }
+
+    fn action_browse(&mut self) {
+        let typed = self.directory.value();
+        let start = if typed.trim().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        } else {
+            let resolved = crate::paths::resolve(Path::new(typed.trim()));
+            if resolved.is_dir() {
+                resolved
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+            }
+        };
+        self.modal = Some(Modal::Picker(Picker::new(&start)));
+    }
+
+    fn plan_options(&self) -> PlanOptions {
+        PlanOptions {
+            recursive: self.recursive,
+            strict: self.strict,
+            min_score: self.level.score(),
+            ..PlanOptions::default()
+        }
+    }
+
+    // ------------------------------------------------------------------ tick lists
+
+    fn toggle_highlighted(&mut self) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        if self.tab != Tab::Matched {
+            return;
+        }
+        let Some(index) = preview.matched_state.selected() else {
+            return;
+        };
+        if let Some(ticked) = preview.ticked.get_mut(index) {
+            *ticked = !*ticked;
+        }
+    }
+
+    fn tick_all(&mut self, ticked: bool) {
+        if let Some(preview) = self.preview.as_mut() {
+            preview.ticked.iter_mut().for_each(|item| *item = ticked);
+        }
+    }
+
+    // ---------------------------------------------------------------- key handling
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if control && matches!(key.code, KeyCode::Char('c')) {
+            self.should_quit = true;
+            return;
+        }
+        if self.modal.is_some() {
+            self.handle_modal_key(key);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Tab => self.focus = self.focus.step(1),
+            KeyCode::BackTab => self.focus = self.focus.step(-1),
+            KeyCode::Char('a') if control => self.tick_all(true),
+            KeyCode::Char('r') if control => self.tick_all(false),
+            _ if self.focus == Focus::Directory => self.handle_directory_key(key),
+            _ => self.handle_command_key(key),
+        }
+    }
+
+    /// While the path field has focus, letters have to type rather than act.
+    fn handle_directory_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.action_preview(),
+            KeyCode::Esc => self.focus = Focus::Results,
+            KeyCode::Char(character) => {
+                self.directory.insert(character);
+                self.invalidate_preview();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.directory.delete_previous_word();
+                self.invalidate_preview();
+            }
+            KeyCode::Backspace => {
+                self.directory.backspace();
+                self.invalidate_preview();
+            }
+            KeyCode::Delete => {
+                self.directory.delete();
+                self.invalidate_preview();
+            }
+            KeyCode::Left => self.directory.move_left(),
+            KeyCode::Right => self.directory.move_right(),
+            KeyCode::Home => self.directory.move_home(),
+            KeyCode::End => self.directory.move_end(),
+            _ => {}
+        }
+    }
+
+    fn handle_command_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('p') => self.action_preview(),
+            KeyCode::Char('a') => self.action_apply(),
+            KeyCode::Char('d') => self.action_demo(),
+            KeyCode::Char('o') => self.action_browse(),
+            KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Char('q') => self.should_quit = true,
+            // A way back to the path field that never risks quitting by accident.
+            KeyCode::Esc => self.focus = Focus::Directory,
+            KeyCode::Char(' ') | KeyCode::Enter => self.activate(),
+            KeyCode::Up => self.navigate(-1),
+            KeyCode::Down => self.navigate(1),
+            KeyCode::PageUp => self.navigate(-10),
+            KeyCode::PageDown => self.navigate(10),
+            KeyCode::Home => self.navigate(isize::MIN),
+            KeyCode::End => self.navigate(isize::MAX),
+            KeyCode::Left => self.adjust(-1),
+            KeyCode::Right => self.adjust(1),
+            _ => {}
+        }
+    }
+
+    /// Space or Enter on whatever currently holds the keyboard.
+    fn activate(&mut self) {
+        match self.focus {
+            Focus::Directory => self.action_preview(),
+            Focus::Recursive => {
+                self.recursive = !self.recursive;
+                self.invalidate_preview();
+            }
+            Focus::Strict => {
+                self.strict = !self.strict;
+                self.invalidate_preview();
+            }
+            Focus::Level => self.set_level(MatchLevel::from_index(
+                (self.level.index() + 1) % MatchLevel::ALL.len(),
+            )),
+            Focus::Results => self.toggle_highlighted(),
+        }
+    }
+
+    /// Up and down: move within a list, or between the setup controls.
+    fn navigate(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Level => {
+                let index = (self.level.index() as isize + delta.signum())
+                    .clamp(0, MatchLevel::ALL.len() as isize - 1);
+                self.set_level(MatchLevel::from_index(index as usize));
+            }
+            Focus::Results => self.move_in_results(delta),
+            _ => self.focus = self.focus.step(delta.signum()),
+        }
+    }
+
+    /// Left and right: switch tabs, set a switch, or step through the levels.
+    fn adjust(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Recursive => {
+                let value = delta > 0;
+                if self.recursive != value {
+                    self.recursive = value;
+                    self.invalidate_preview();
+                }
+            }
+            Focus::Strict => {
+                let value = delta > 0;
+                if self.strict != value {
+                    self.strict = value;
+                    self.invalidate_preview();
+                }
+            }
+            Focus::Level => self.navigate(delta),
+            Focus::Results => {
+                self.tab = if delta > 0 {
+                    Tab::Skipped
+                } else {
+                    Tab::Matched
+                };
+            }
+            Focus::Directory => {}
+        }
+    }
+
+    fn set_level(&mut self, level: MatchLevel) {
+        if self.level == level {
+            return;
+        }
+        self.level = level;
+        self.invalidate_preview();
+    }
+
+    fn move_in_results(&mut self, delta: isize) {
+        let tab = self.tab;
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        match tab {
+            Tab::Matched => {
+                let count = preview.prepared.len();
+                let selected = move_selection(preview.matched_state.selected(), count, delta);
+                preview.matched_state.select(selected);
+            }
+            Tab::Skipped => {
+                let count = preview.plan.skipped.len();
+                let selected = move_selection(preview.skipped_state.selected(), count, delta);
+                preview.skipped_state.select(selected);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------- modals
+
+    fn handle_modal_key(&mut self, key: KeyEvent) {
+        match self.modal.as_mut() {
+            Some(Modal::Help) => {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q')
+                ) {
+                    self.modal = None;
+                }
+            }
+            Some(Modal::Confirm { .. }) => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.modal = None;
+                    self.start_apply();
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'q') => self.modal = None,
+                _ => {}
+            },
+            Some(Modal::Picker(picker)) => match key.code {
+                KeyCode::Up => picker.move_up(),
+                KeyCode::Down => picker.move_down(),
+                KeyCode::Enter | KeyCode::Right => picker.enter(),
+                KeyCode::Backspace | KeyCode::Left => picker.leave(),
+                KeyCode::Char('s') => {
+                    let chosen = picker.current.clone();
+                    self.modal = None;
+                    self.directory.set_value(&chosen.to_string_lossy());
+                    self.invalidate_preview();
+                    self.focus = Focus::Directory;
+                }
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
+                _ => {}
+            },
+            None => {}
+        }
+    }
+}
+
+/// Move a list selection by `delta`, staying inside `0..count`.
+///
+/// [`ListState::select_next`] is unbounded, which lets the cursor drift past the
+/// end of a list; this keeps it in range.
+pub fn move_selection(selected: Option<usize>, count: usize, delta: isize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let current = selected.unwrap_or(0).min(count - 1) as isize;
+    let last = count as isize - 1;
+    Some(current.saturating_add(delta).clamp(0, last) as usize)
+}
+
+fn first_error(result: &ApplyResult) -> String {
+    result
+        .failed
+        .first()
+        .and_then(|outcome| outcome.error.clone())
+        .unwrap_or_else(|| "unknown error".into())
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        one.into()
+    } else {
+        many.into()
+    }
+}

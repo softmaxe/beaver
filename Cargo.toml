@@ -1,0 +1,29 @@
+[package]
+name = "rename-subtitles"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Rename subtitle files to match their videos, from a terminal UI or a CLI."
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "rename_subtitles"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rename-subs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+ratatui = "0.30.2"
+unicode-normalization = "0.1.25"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+strip = true
