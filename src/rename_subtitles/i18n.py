@@ -63,8 +63,9 @@ CATALOG: dict[str, dict[str, str]] = {
         "skip.no_video": "该目录没有视频文件",
         "skip.collision": "目标名冲突",
         # Status line and errors.
-        "status.ready": "输入目录后按 P 生成预览",
+        "status.ready": "填写目录后按 Enter 生成预览",
         "status.scanning": "正在扫描…",
+        "status.previewed": "预览完成；勾选后按 A 应用",
         "status.stale": "选项已改动，请重新生成预览",
         "status.demo": "演示模式：样本数据，不会改动磁盘",
         "status.applying": "正在应用…",
@@ -92,7 +93,8 @@ CATALOG: dict[str, dict[str, str]] = {
         # Help modal.
         "help.title": "快捷键",
         "help.close": "关闭",
-        "help.workflow": "工作流：填目录 → P 预览 → 勾选 → A 应用",
+        "help.workflow": "工作流：填目录 → Enter/P 预览 → 勾选 → A 应用",
+        "help.note": "输入框获得焦点时，单字母快捷键会被当作输入；按 Tab 离开输入框即可使用。",
     },
     "en": {
         "app.title": "Subtitle Renamer",
@@ -146,8 +148,9 @@ CATALOG: dict[str, dict[str, str]] = {
         "skip.no_video": "No video files in this folder",
         "skip.collision": "Target name taken",
         # Status line and errors.
-        "status.ready": "Enter a directory, then press P to preview",
+        "status.ready": "Type a directory path, then press Enter to preview",
         "status.scanning": "Scanning…",
+        "status.previewed": "Preview ready — tick items, then press A to apply",
         "status.stale": "Options changed — preview again",
         "status.demo": "Demo mode: sample data, nothing is written",
         "status.applying": "Applying…",
@@ -175,7 +178,8 @@ CATALOG: dict[str, dict[str, str]] = {
         # Help modal.
         "help.title": "Keyboard shortcuts",
         "help.close": "Close",
-        "help.workflow": "Workflow: directory → P preview → tick → A apply",
+        "help.workflow": "Workflow: directory → Enter or P to preview → tick → A to apply",
+        "help.note": "Single-letter shortcuts type into the path field while it has focus; press Tab to leave it.",
     },
 }
 

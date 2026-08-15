@@ -1,0 +1,209 @@
+/* Only theme variables are used here, so switching themes never reloads the CSS. */
+
+Screen {
+    background: $background;
+}
+
+#workspace {
+    height: 1fr;
+}
+
+/* ------------------------------------------------------------- left column */
+
+#setup {
+    width: 40;
+    padding: 1 2;
+    background: $surface;
+    border-right: vkey $panel;
+}
+
+.section-heading {
+    color: $text-accent;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#setup Label {
+    margin-top: 1;
+}
+
+#setup Input {
+    margin-top: 0;
+}
+
+.wide-button {
+    width: 100%;
+    margin-top: 1;
+}
+
+.option-row {
+    height: auto;
+    margin-top: 1;
+}
+
+.option-row Switch {
+    margin: 0 1 0 0;
+}
+
+.option-label {
+    height: 3;
+    content-align: left middle;
+    margin-top: 0;
+}
+
+.hint {
+    color: $text-muted;
+    text-style: italic;
+    margin-top: 0;
+}
+
+#match-level {
+    width: 100%;
+    border: none;
+    padding: 0;
+    background: $surface;
+}
+
+/* ------------------------------------------------------------ right column */
+
+#results {
+    width: 1fr;
+    padding: 1 2;
+}
+
+#summary {
+    height: auto;
+    color: $text-accent;
+    text-style: bold;
+}
+
+#tabs {
+    height: 1fr;
+    margin-top: 1;
+}
+
+#operations,
+#skipped {
+    height: 1fr;
+    background: $surface;
+    border: none;
+}
+
+#detail {
+    height: 1;
+    color: $text-muted;
+}
+
+#status {
+    height: 1;
+    margin-top: 1;
+    color: $text-secondary;
+
+    &.-error {
+        color: $text-error;
+        text-style: bold;
+    }
+}
+
+/* ------------------------------------------------------------------ modals */
+
+DirectoryPickerScreen,
+ConfirmApplyScreen,
+HelpScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#picker-dialog,
+#confirm-dialog,
+#help-dialog {
+    width: 70;
+    max-width: 90%;
+    height: auto;
+    padding: 1 2;
+    background: $panel;
+    border: round $primary;
+}
+
+#picker-dialog {
+    height: 26;
+}
+
+#picker-title,
+#confirm-title,
+#help-title {
+    color: $text-accent;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#picker-tree {
+    height: 1fr;
+    background: $surface;
+}
+
+#picker-current {
+    height: 1;
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#picker-actions,
+#confirm-actions {
+    height: auto;
+    align-horizontal: right;
+    margin-top: 1;
+}
+
+#picker-actions Button,
+#confirm-actions Button {
+    margin-left: 2;
+}
+
+#confirm-examples {
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#help-workflow {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+#help-shortcuts {
+    margin-bottom: 1;
+}
+
+#help-note {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+/* --------------------------------------------------- narrow terminals (<100) */
+
+Screen.-narrow {
+    #workspace {
+        layout: vertical;
+    }
+
+    /* Setup keeps its own scrollbar and gives up more than half the height, so
+       the results always stay on screen even in an 80x24 terminal. */
+    #setup {
+        width: 100%;
+        height: auto;
+        max-height: 45%;
+        padding: 0 1;
+        border-right: none;
+        border-bottom: hkey $panel;
+    }
+
+    #results {
+        height: 1fr;
+        min-height: 8;
+        padding: 0 1;
+    }
+
+    #setup .section-heading {
+        margin-bottom: 0;
+    }
+}
