@@ -137,6 +137,25 @@ given.
 
 Matching is scoped per directory: a subtitle is only ever matched against videos in its own folder.
 
+## A folder to practise on
+
+Demo mode shows the workflow but never writes anything. To try a real apply on files that do not
+matter, generate a throwaway library:
+
+```bash
+scripts/make-demo-library.sh          # creates ./demo-library
+cargo run -- --tui demo-library       # then turn on "include subfolders" and press p
+```
+
+It contains fake videos and subtitles named the way real releases are, arranged so every outcome
+shows up at once: episode-ID matches, fuzzy matches at three different strengths, a missing episode,
+files already named correctly, a taken target name, an episode two videos claim, CJK names, and
+subtitles with no video beside them. Stepping the match level or flipping the strict switch visibly
+changes the plan.
+
+Renaming mutates the folder, so re-run the script for a clean slate. It only ever writes to a
+directory it created itself, and `rm -rf demo-library` removes it.
+
 ## Layout
 
 ```
@@ -149,6 +168,9 @@ src/
 ├── paths.rs          # path helpers
 ├── cli.rs            # command-line front-end
 └── tui/              # terminal front-end (ratatui)
+
+scripts/
+└── make-demo-library.sh   # throwaway files to try the interface on
 ```
 
 ## Tests and checks
