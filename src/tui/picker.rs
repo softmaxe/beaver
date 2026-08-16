@@ -54,13 +54,9 @@ impl Picker {
         });
     }
 
-    pub fn move_down(&mut self) {
-        let selected = move_selection(self.state.selected(), self.entries.len(), 1);
-        self.state.select(selected);
-    }
-
-    pub fn move_up(&mut self) {
-        let selected = move_selection(self.state.selected(), self.entries.len(), -1);
+    /// Move the highlight by `delta` rows, staying inside the listing.
+    pub fn move_by(&mut self, delta: isize) {
+        let selected = move_selection(self.state.selected(), self.entries.len(), delta);
         self.state.select(selected);
     }
 
@@ -112,7 +108,7 @@ mod tests {
         assert_eq!(picker.entries.len(), 2);
         assert_eq!(picker.state.selected(), Some(0));
 
-        picker.move_down();
+        picker.move_by(1);
         picker.enter();
         assert_eq!(picker.current, root.join("season two"));
         assert!(picker.entries.is_empty());

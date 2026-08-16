@@ -63,6 +63,18 @@ impl TextInput {
         self.cursor = self.characters.len();
     }
 
+    /// Throw the whole path away, the way `Ctrl+U` behaves in a shell.
+    pub fn clear(&mut self) {
+        self.characters.clear();
+        self.cursor = 0;
+        self.offset = 0;
+    }
+
+    /// Drop everything after the cursor, the way `Ctrl+K` behaves in a shell.
+    pub fn delete_to_end(&mut self) {
+        self.characters.truncate(self.cursor);
+    }
+
     /// Drop the last path segment, the way `Ctrl+W` behaves in a shell.
     pub fn delete_previous_word(&mut self) {
         while self.cursor > 0 && is_separator(self.characters[self.cursor - 1]) {
@@ -89,8 +101,23 @@ impl TextInput {
         while self.columns(self.offset, self.cursor) > usable {
             self.offset += 1;
         }
+        // A path that has scrolled off to the left says so, otherwise the middle
+        // of a long path reads as the whole of a wrong one. The leading mark
+        // costs a column, so the window is measured again once it is known.
+        let scrolled = self.offset > 0;
+        if scrolled {
+            let usable = width.saturating_sub(2).max(1);
+            while self.columns(self.offset, self.cursor) > usable {
+                self.offset += 1;
+            }
+        }
+
         let mut text = String::new();
         let mut used = 0;
+        if scrolled {
+            text.push('…');
+            used = 1;
+        }
         for character in &self.characters[self.offset.min(self.characters.len())..] {
             let character_width = character.width().unwrap_or(0);
             if used + character_width > width {
@@ -99,7 +126,10 @@ impl TextInput {
             used += character_width;
             text.push(*character);
         }
-        (text, self.columns(self.offset, self.cursor))
+        (
+            text,
+            self.columns(self.offset, self.cursor) + usize::from(scrolled),
+        )
     }
 
     /// Display width of `characters[from..to]`.
@@ -148,16 +178,39 @@ mod tests {
     }
 
     #[test]
+    fn clears_the_line_and_the_tail_after_the_cursor() {
+        let mut field = input("/tmp/shows");
+        field.move_left();
+        field.delete_to_end();
+        assert_eq!(field.value(), "/tmp/show");
+
+        field.clear();
+        assert_eq!(field.value(), "");
+        field.insert('/');
+        assert_eq!(field.value(), "/");
+    }
+
+    #[test]
     fn scrolls_to_keep_the_cursor_in_view() {
         let mut field = input("/a/very/long/path/that/does/not/fit");
         let (text, cursor) = field.view(10);
         assert!(text.ends_with("not/fit"));
         assert!(cursor < 10);
+        // Scrolled: the mark says the start of the path is off to the left.
+        assert!(text.starts_with('…'));
 
         field.move_home();
         let (text, cursor) = field.view(10);
         assert!(text.starts_with("/a/very"));
         assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn a_path_that_fits_carries_no_scroll_mark() {
+        let mut field = input("/tmp/shows");
+        let (text, cursor) = field.view(20);
+        assert_eq!(text, "/tmp/shows");
+        assert_eq!(cursor, 10);
     }
 
     #[test]

@@ -126,7 +126,7 @@ the file. The detail line under the list always spells the highlighted row out i
 
 ## Keyboard
 
-The full table lives in `README.md` and in the `?` modal. Two rules govern it:
+The full table lives in `README.md` and in the `?` modal. Four rules govern it:
 
 - Single-letter keys for the workflow verbs (`p`, `a`, `d`, `o`), `Ctrl`-modified for the bulk
   selection operations, and `?` / `q` for the interface itself.
@@ -134,6 +134,18 @@ The full table lives in `README.md` and in the `?` modal. Two rules govern it:
   priority bindings — which would make paths untypeable — `Enter` submits the path field, `Esc`
   leaves it, and focus moves to the results list after a successful preview so the verbs work
   immediately.
+- Arrows are the default and `hjkl` / `g` / `G` / `Ctrl+D` / `Ctrl+U` are aliases for them. A vim
+  user should not have to look anything up, and everyone else should never meet a mode. The same
+  goes for `Ctrl`: over a list it selects and pages, inside the path field it is readline, because
+  a key that means two things in two places is easier than a key that works in only one.
+- Nothing is ever trapped. Up and down leave the match-level group and the path field at their
+  edges rather than stopping dead, so `Tab` is a convenience and never the only way out.
+
+Discoverability is a layout problem, not a documentation one. The footer lists the keys the focused
+control answers to and rewrites itself as focus moves; the ticking keys are also printed on the
+bottom edge of the list they act on; a `▸` marks the row holding the keyboard, and the focused
+control repeats its key at the end of its own row. The `?` modal is then a reference, not a
+prerequisite.
 
 ## Language
 

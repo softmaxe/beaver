@@ -26,6 +26,10 @@ use crate::tui::picker::Picker;
 /// How many renames the confirmation dialog spells out before summarising.
 const CONFIRM_EXAMPLE_LIMIT: usize = 5;
 
+/// Rows a page key moves through a list, and half of it for `ctrl+d` / `ctrl+u`.
+const PAGE: isize = 10;
+const HALF_PAGE: isize = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Directory,
@@ -459,14 +463,31 @@ impl App {
 
     // ------------------------------------------------------------------ tick lists
 
+    /// Space on a rename. Says why nothing happened rather than staying silent,
+    /// because a key that does nothing reads as a broken key.
     fn toggle_highlighted(&mut self) {
+        let tab = self.tab;
         let Some(preview) = self.preview.as_mut() else {
+            self.status = Status::new(
+                "Nothing to tick yet — p to preview, d for a demo",
+                StatusKind::Error,
+            );
             return;
         };
-        if self.tab != Tab::Matched {
+        if tab != Tab::Matched {
+            self.status = Status::new(
+                "Skipped files are not renamed — press ← for the renames",
+                StatusKind::Ready,
+            );
             return;
         }
+        // A preview with nothing in it has no highlighted row to tick, which is
+        // the same dead key felt from the other direction.
         let Some(index) = preview.matched_state.selected() else {
+            self.status = Status::new(
+                "Nothing matched here — try a looser match level, or another folder",
+                StatusKind::Ready,
+            );
             return;
         };
         if let Some(ticked) = preview.ticked.get_mut(index) {
@@ -503,18 +524,43 @@ impl App {
         match key.code {
             KeyCode::Tab => self.focus = self.focus.step(1),
             KeyCode::BackTab => self.focus = self.focus.step(-1),
-            KeyCode::Char('a') if control => self.tick_all(true),
-            KeyCode::Char('r') if control => self.tick_all(false),
+            KeyCode::F(1) => self.modal = Some(Modal::Help),
+            // Control keys mean one thing while text is being typed and another
+            // over a list, so each context claims its own.
             _ if self.focus == Focus::Directory => self.handle_directory_key(key),
             _ => self.handle_command_key(key),
         }
     }
 
     /// While the path field has focus, letters have to type rather than act.
+    ///
+    /// The control keys are the ones a shell prompt answers to, so muscle memory
+    /// from the command line carries over.
     fn handle_directory_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Enter => self.action_preview(),
             KeyCode::Esc => self.focus = Focus::Results,
+            // The field is the first row of a form, so up and down leave it.
+            KeyCode::Up => self.focus = self.focus.step(-1),
+            KeyCode::Down => self.focus = self.focus.step(1),
+            KeyCode::Char('a') if control => self.directory.move_home(),
+            KeyCode::Char('e') if control => self.directory.move_end(),
+            KeyCode::Char('u') if control => {
+                self.directory.clear();
+                self.invalidate_preview();
+            }
+            KeyCode::Char('k') if control => {
+                self.directory.delete_to_end();
+                self.invalidate_preview();
+            }
+            KeyCode::Char('w') if control => {
+                self.directory.delete_previous_word();
+                self.invalidate_preview();
+            }
+            // Anything else held with control is a command from elsewhere; it
+            // must not end up in the path.
+            KeyCode::Char(_) if control => {}
             KeyCode::Char(character) => {
                 self.directory.insert(character);
                 self.invalidate_preview();
@@ -539,25 +585,37 @@ impl App {
         }
     }
 
+    /// Everywhere outside the path field, where arrows and their vim twins both
+    /// navigate and single letters act.
     fn handle_command_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('a') if control => self.tick_all(true),
+            KeyCode::Char('r') if control => self.tick_all(false),
+            KeyCode::Char('d') if control => self.navigate(HALF_PAGE),
+            KeyCode::Char('u') if control => self.navigate(-HALF_PAGE),
+            KeyCode::Char('f') if control => self.navigate(PAGE),
+            KeyCode::Char('b') if control => self.navigate(-PAGE),
+            KeyCode::Char(_) if control => {}
             KeyCode::Char('p') => self.action_preview(),
             KeyCode::Char('a') => self.action_apply(),
             KeyCode::Char('d') => self.action_demo(),
             KeyCode::Char('o') => self.action_browse(),
+            // The vim way back into the field that esc leaves.
+            KeyCode::Char('i') => self.focus = Focus::Directory,
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char('q') => self.request_quit(),
             // A way back to the path field that never risks quitting by accident.
             KeyCode::Esc => self.focus = Focus::Directory,
             KeyCode::Char(' ') | KeyCode::Enter => self.activate(),
-            KeyCode::Up => self.navigate(-1),
-            KeyCode::Down => self.navigate(1),
-            KeyCode::PageUp => self.navigate(-10),
-            KeyCode::PageDown => self.navigate(10),
-            KeyCode::Home => self.navigate(isize::MIN),
-            KeyCode::End => self.navigate(isize::MAX),
-            KeyCode::Left => self.adjust(-1),
-            KeyCode::Right => self.adjust(1),
+            KeyCode::Up | KeyCode::Char('k') => self.navigate(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.navigate(1),
+            KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
+            KeyCode::PageUp => self.navigate(-PAGE),
+            KeyCode::PageDown => self.navigate(PAGE),
+            KeyCode::Home | KeyCode::Char('g') => self.navigate(isize::MIN),
+            KeyCode::End | KeyCode::Char('G') => self.navigate(isize::MAX),
             _ => {}
         }
     }
@@ -584,14 +642,36 @@ impl App {
     /// Up and down: move within a list, or between the setup controls.
     fn navigate(&mut self, delta: isize) {
         match self.focus {
-            Focus::Level => {
-                let index = (self.level.index() as isize + delta.signum())
-                    .clamp(0, MatchLevel::ALL.len() as isize - 1);
-                self.set_level(MatchLevel::from_index(index as usize));
-            }
+            Focus::Level => self.step_level(delta),
             Focus::Results => self.move_in_results(delta),
-            _ => self.focus = self.focus.step(delta.signum()),
+            _ if delta == 1 || delta == -1 => self.focus = self.focus.step(delta.signum()),
+            // A switch is one row, so first and last mean the ends of the whole
+            // column rather than a nudge to the neighbour.
+            _ => {
+                self.focus = if delta > 0 {
+                    Focus::Results
+                } else {
+                    Focus::Directory
+                }
+            }
         }
+    }
+
+    /// Walk the match levels, leaving the group at either end.
+    ///
+    /// Without that the keyboard is trapped: three radios that up and down can
+    /// never step out of, with only tab as the way on.
+    fn step_level(&mut self, delta: isize) {
+        let last = MatchLevel::ALL.len() as isize - 1;
+        let target = (self.level.index() as isize).saturating_add(delta);
+        // A jump (home, end, a page) stays inside the group; a single step off
+        // the end moves to the neighbouring control.
+        let single_step = delta == 1 || delta == -1;
+        if single_step && !(0..=last).contains(&target) {
+            self.focus = self.focus.step(delta.signum());
+            return;
+        }
+        self.set_level(MatchLevel::from_index(target.clamp(0, last) as usize));
     }
 
     /// Left and right: switch tabs, set a switch, or step through the levels.
@@ -611,7 +691,13 @@ impl App {
                     self.invalidate_preview();
                 }
             }
-            Focus::Level => self.navigate(delta),
+            // Sideways within the group only: unlike up and down, this never
+            // hands the keyboard to another control.
+            Focus::Level => {
+                let last = MatchLevel::ALL.len() as isize - 1;
+                let target = (self.level.index() as isize + delta.signum()).clamp(0, last);
+                self.set_level(MatchLevel::from_index(target as usize));
+            }
             Focus::Results => {
                 self.tab = if delta > 0 {
                     Tab::Skipped
@@ -682,11 +768,21 @@ impl App {
                 _ => {}
             },
             Some(Modal::Picker(picker)) => match key.code {
-                KeyCode::Up => picker.move_up(),
-                KeyCode::Down => picker.move_down(),
-                KeyCode::Enter | KeyCode::Right => picker.enter(),
-                KeyCode::Backspace | KeyCode::Left => picker.leave(),
-                KeyCode::Char('s') => {
+                KeyCode::Up | KeyCode::Char('k') => picker.move_by(-1),
+                KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
+                KeyCode::PageUp => picker.move_by(-PAGE),
+                KeyCode::PageDown => picker.move_by(PAGE),
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    picker.move_by(-HALF_PAGE)
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    picker.move_by(HALF_PAGE)
+                }
+                KeyCode::Home | KeyCode::Char('g') => picker.move_by(isize::MIN),
+                KeyCode::End | KeyCode::Char('G') => picker.move_by(isize::MAX),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => picker.enter(),
+                KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => picker.leave(),
+                KeyCode::Char('s' | ' ') => {
                     let chosen = picker.current.clone();
                     self.modal = None;
                     self.directory.set_value(&chosen.to_string_lossy());

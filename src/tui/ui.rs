@@ -80,25 +80,57 @@ fn draw_header(frame: &mut Frame, area: Rect) {
     );
 }
 
+/// The keys the focused control answers to, then the two that always apply.
+///
+/// A fixed list would have to be either too long to read or too short to help;
+/// showing what is live right now is what makes ticking and toggling findable
+/// without opening the help.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let apply_style = if app.can_apply() {
         theme::key()
     } else {
         theme::faint()
     };
+    let mut hints: Vec<(&str, &str, Style)> = match app.focus {
+        Focus::Directory => vec![
+            ("enter", "preview", theme::key()),
+            ("o", "browse", theme::key()),
+            ("↓", "next field", theme::key()),
+            ("esc", "leave field", theme::key()),
+        ],
+        Focus::Recursive | Focus::Strict => vec![
+            ("space", "toggle", theme::key()),
+            ("←→", "set", theme::key()),
+            ("↑↓", "move", theme::key()),
+            ("p", "preview", theme::key()),
+        ],
+        Focus::Level => vec![
+            ("↑↓", "choose", theme::key()),
+            ("space", "cycle", theme::key()),
+            ("p", "preview", theme::key()),
+        ],
+        Focus::Results => vec![
+            ("space", "tick", theme::key()),
+            ("a", "apply", apply_style),
+            ("p", "preview", theme::key()),
+            ("←→", "tabs", theme::key()),
+            ("^a", "all", theme::key()),
+            ("^r", "none", theme::key()),
+            ("d", "demo", theme::key()),
+        ],
+    };
+    hints.push(("?", "help", theme::key()));
+    hints.push(("q", "quit", theme::key()));
+
+    // Help and quit are the two that survive a narrow terminal; the rest drop
+    // off the end until the line fits.
+    const ALWAYS_KEPT: usize = 2;
+    while hints.len() > ALWAYS_KEPT && hints_width(&hints) > area.width as usize {
+        hints.remove(hints.len() - ALWAYS_KEPT - 1);
+    }
+
     let mut spans = vec![Span::raw(" ")];
-    for (index, (key, label, style)) in [
-        ("p", "preview", theme::key()),
-        ("a", "apply", apply_style),
-        ("d", "demo", theme::key()),
-        ("o", "browse", theme::key()),
-        ("space", "tick", theme::key()),
-        ("?", "help", theme::key()),
-        ("q", "quit", theme::key()),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (index, (key, label, style)) in hints.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(" · ", theme::faint()));
         }
@@ -109,6 +141,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::PANEL)),
         area,
     );
+}
+
+/// Columns the footer takes: a leading space, the pairs, and " · " between them.
+fn hints_width(hints: &[(&str, &str, Style)]) -> usize {
+    let pairs: usize = hints
+        .iter()
+        .map(|(key, label, _)| key.width() + 1 + label.width())
+        .sum();
+    1 + pairs + 3 * hints.len().saturating_sub(1)
 }
 
 // ------------------------------------------------------------- setup column
@@ -131,8 +172,10 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
     rows.push(SetupRow::text(label_line(
         "Directory",
         app.focus == Focus::Directory,
+        "enter",
+        width,
     )));
-    let (text, cursor) = app.directory.view(width.saturating_sub(2));
+    let (text, cursor) = app.directory.view(width.saturating_sub(3));
     rows.push(SetupRow::input(
         &text,
         app.directory.is_empty(),
@@ -142,6 +185,7 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
     rows.push(SetupRow::text(hint_line("o  browse for a folder")));
     rows.push(SetupRow::blank());
 
+    rows.push(SetupRow::text(label_line("Options", false, "", width)));
     let recursive_row = rows.len();
     rows.push(SetupRow::switch(
         app.recursive,
@@ -167,6 +211,8 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
     rows.push(SetupRow::text(label_line(
         "Match level",
         app.focus == Focus::Level,
+        "↑↓",
+        width,
     )));
     let mut level_rows = Vec::new();
     for level in MatchLevel::ALL {
@@ -223,7 +269,7 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
         let line_area = Rect::new(inner.x, y, inner.width, 1);
         frame.render_widget(Paragraph::new(row.line.clone()).style(row.style), line_area);
         if offset == input_row && app.focus == Focus::Directory {
-            let column = inner.x + 1 + cursor as u16;
+            let column = inner.x + 2 + cursor as u16;
             frame.set_cursor_position((column.min(inner.right().saturating_sub(1)), y));
         }
     }
@@ -261,7 +307,10 @@ impl SetupRow {
             Span::styled(text.to_string(), Style::default().fg(theme::FOREGROUND))
         };
         Self {
-            line: Line::from(vec![Span::raw(" "), content]),
+            line: Line::from(vec![
+                Span::styled(caret(focused), Style::default().fg(theme::FOCUS)),
+                content,
+            ]),
             style: Style::default().bg(if focused {
                 theme::SELECTION_BACKGROUND
             } else {
@@ -276,7 +325,7 @@ impl SetupRow {
         } else {
             Span::styled("[ ] ", theme::faint())
         };
-        Self::control(marker, label, focused, width)
+        Self::control(marker, label, focused, "space", width)
     }
 
     fn radio(selected: bool, label: &str, focused: bool, width: usize) -> Self {
@@ -285,10 +334,18 @@ impl SetupRow {
         } else {
             Span::styled("( ) ", theme::faint())
         };
-        Self::control(marker, label, focused && selected, width)
+        Self::control(marker, label, focused && selected, "", width)
     }
 
-    fn control(marker: Span<'static>, label: &str, highlighted: bool, width: usize) -> Self {
+    /// A checkbox or radio row: caret, marker, label, and — while it holds the
+    /// keyboard — the key that changes it, spelled out at the end of the row.
+    fn control(
+        marker: Span<'static>,
+        label: &str,
+        highlighted: bool,
+        hint: &str,
+        width: usize,
+    ) -> Self {
         let label_style = if highlighted {
             Style::default()
                 .fg(theme::FOREGROUND)
@@ -296,12 +353,18 @@ impl SetupRow {
         } else {
             Style::default().fg(theme::MUTED)
         };
+        let hint = if highlighted { hint } else { "" };
+        let room = width.saturating_sub(CARET.width() + 4);
+        let mut spans = vec![
+            Span::styled(caret(highlighted), Style::default().fg(theme::FOCUS)),
+            marker,
+            Span::styled(pad(label, room.saturating_sub(hint.width())), label_style),
+        ];
+        if !hint.is_empty() {
+            spans.push(Span::styled(hint.to_string(), theme::faint()));
+        }
         Self {
-            line: Line::from(vec![
-                Span::raw(" "),
-                marker,
-                Span::styled(pad(label, width.saturating_sub(6)), label_style),
-            ]),
+            line: Line::from(spans),
             style: Style::default().bg(if highlighted {
                 theme::SELECTION_BACKGROUND
             } else {
@@ -339,7 +402,18 @@ impl SetupRow {
     }
 }
 
-fn label_line(text: &str, focused: bool) -> Line<'static> {
+/// The mark in front of whatever holds the keyboard, in every list on screen.
+const CARET: &str = "▸ ";
+
+fn caret(focused: bool) -> String {
+    if focused {
+        CARET.to_string()
+    } else {
+        " ".repeat(CARET.width())
+    }
+}
+
+fn label_line(text: &str, focused: bool, hint: &str, width: usize) -> Line<'static> {
     let style = if focused {
         Style::default()
             .fg(theme::FOCUS)
@@ -347,11 +421,25 @@ fn label_line(text: &str, focused: bool) -> Line<'static> {
     } else {
         Style::default().fg(theme::MUTED)
     };
-    Line::from(Span::styled(format!(" {text}"), style))
+    // Headings take the indent of the rows below them but never the caret: that
+    // marks a row the keyboard is on, and a heading is not one.
+    let mut spans = vec![
+        Span::raw(" ".repeat(CARET.width())),
+        Span::styled(text.to_string(), style),
+    ];
+    if focused && !hint.is_empty() {
+        let room = width.saturating_sub(CARET.width() + text.width() + hint.width());
+        spans.push(Span::raw(" ".repeat(room)));
+        spans.push(Span::styled(hint.to_string(), theme::faint()));
+    }
+    Line::from(spans)
 }
 
 fn hint_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(format!(" {text}"), theme::faint()))
+    Line::from(Span::styled(
+        format!("{}{text}", " ".repeat(CARET.width())),
+        theme::faint(),
+    ))
 }
 
 // ------------------------------------------------------------ results column
@@ -367,12 +455,20 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     draw_summary(frame, app, summary_area);
 
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::border(app.focus == Focus::Results))
         .style(Style::default().bg(theme::SURFACE))
         .title_top(tab_line(app))
         .padding(Padding::horizontal(1));
+    // The keys that tick, printed on the box they act on. The footer says the
+    // same thing, but this is where the eye already is.
+    if app.tab == Tab::Matched && app.preview.as_ref().is_some_and(|p| !p.prepared.is_empty()) {
+        block = block.title_bottom(Span::styled(
+            " space  tick · ^a  all · ^r  none ",
+            theme::faint(),
+        ));
+    }
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
 
@@ -388,26 +484,33 @@ fn tab_line(app: &App) -> Line<'static> {
     let (matched, skipped) = app.preview.as_ref().map_or((0, 0), |preview| {
         (preview.prepared.len(), preview.plan.skipped.len())
     });
+    // The open tab is a filled chip rather than just bold text, so which of the
+    // two lists is on screen reads at a glance.
     let style = |active: bool| {
         if active {
             Style::default()
                 .fg(theme::FOREGROUND)
+                .bg(theme::SELECTION_BACKGROUND)
                 .add_modifier(Modifier::BOLD)
         } else {
             theme::faint()
         }
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" To rename ({matched}) "),
             style(app.tab == Tab::Matched),
         ),
-        Span::styled("│", theme::faint()),
+        Span::raw(" "),
         Span::styled(
             format!(" Skipped ({skipped}) "),
             style(app.tab == Tab::Skipped),
         ),
-    ])
+    ];
+    if app.focus == Focus::Results {
+        spans.push(Span::styled(" ←→ ", theme::faint()));
+    }
+    Line::from(spans)
 }
 
 fn draw_summary(frame: &mut Frame, app: &App, area: Rect) {
@@ -467,7 +570,8 @@ fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let width = area.width as usize;
+    // The caret takes a column from every row, highlighted or not.
+    let width = (area.width as usize).saturating_sub(CARET.width());
     let items: Vec<ListItem> = preview
         .prepared
         .iter()
@@ -476,7 +580,7 @@ fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(operation_line(prepared, *ticked, &preview.plan, width))
         })
         .collect();
-    let list = List::new(items).highlight_style(
+    let list = List::new(items).highlight_symbol(CARET).highlight_style(
         Style::default()
             .bg(theme::SELECTION_BACKGROUND)
             .add_modifier(Modifier::BOLD),
@@ -551,6 +655,7 @@ fn draw_skipped(frame: &mut Frame, app: &mut App, area: Rect) {
         [Constraint::Percentage(60), Constraint::Percentage(40)],
     )
     .header(Row::new(vec!["Source", "Reason"]).style(theme::faint().add_modifier(Modifier::BOLD)))
+    .highlight_symbol(CARET)
     .row_highlight_style(Style::default().bg(theme::SELECTION_BACKGROUND));
     frame.render_stateful_widget(table, area, &mut preview.skipped_state);
 }
@@ -611,31 +716,35 @@ fn placeholder(text: &str) -> Paragraph<'static> {
 
 // ------------------------------------------------------------------- modals
 
+/// Every key, grouped by what it is for, with the vim spelling beside the arrows.
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let shortcuts: [(&str, &str); 12] = [
-        ("enter", "Preview (from the path field)"),
+    let shortcuts: [(&str, &str); 15] = [
+        ("tab / shift+tab", "Next / previous control"),
+        ("↑ ↓  or  k j", "Move in a control, and between them"),
+        ("← →  or  h l", "Set the option, or switch tab"),
+        ("home end / g G", "First / last row"),
+        ("ctrl+d/u  ctrl+f/b", "Half a page, or a whole one"),
+        ("i / esc", "Enter / leave the path field"),
+        ("space", "Tick or untick the highlighted rename"),
+        ("enter", "Preview from the path field, else as space"),
+        ("ctrl+a / ctrl+r", "Tick everything / nothing"),
         ("p", "Preview"),
         ("a", "Apply the ticked renames"),
         ("d", "Demo mode"),
         ("o", "Browse for a directory"),
-        ("space", "Tick or untick the highlighted rename"),
-        ("ctrl+a", "Tick everything"),
-        ("ctrl+r", "Untick everything"),
-        ("tab", "Move between controls"),
-        ("← →", "Switch tab, or set the focused option"),
         ("?", "This list"),
         ("q", "Quit"),
     ];
     let mut lines = vec![
         Line::from(Span::styled(
-            "Workflow: directory → enter or p to preview → tick → a to apply",
+            "Workflow: path → enter or p to preview → space to tick → a to apply",
             theme::muted(),
         )),
         Line::default(),
     ];
     lines.extend(shortcuts.iter().map(|(key, description)| {
         Line::from(vec![
-            Span::styled(format!("{key:<8}"), theme::key()),
+            Span::styled(format!("{key:<20}"), theme::key()),
             Span::styled(
                 (*description).to_string(),
                 Style::default().fg(theme::FOREGROUND),
@@ -644,11 +753,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     }));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        "Single letters type into the path field while it has focus; press tab or esc to leave it.",
+        "In the path field letters type: ctrl+a/e jump, ctrl+u/k/w delete.",
         theme::faint(),
     )));
 
-    let popup = centered(area, 68, lines.len() as u16 + 4);
+    let popup = centered(area, 72, lines.len() as u16 + 4);
     render_dialog(
         frame,
         popup,
@@ -704,7 +813,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &mut crate::tui::picker::P
         .style(Style::default().bg(theme::PANEL))
         .title_top(Span::styled(" Choose a directory ", theme::heading()))
         .title_bottom(Span::styled(
-            " enter  open   ←  up   s  use this folder   esc  cancel ",
+            " ↑↓/jk  move   enter/l  open   ←/h  up   s  use folder   esc  cancel ",
             theme::faint(),
         ))
         .padding(Padding::horizontal(1));

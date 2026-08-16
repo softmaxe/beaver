@@ -54,25 +54,34 @@ real folder. Demo plans can never be applied.
 
 ### Shortcuts
 
-| Key      | Action                                          |
-| -------- | ----------------------------------------------- |
-| `Enter`  | Preview (while the path field has focus)        |
-| `p`      | Preview                                         |
-| `a`      | Apply the ticked renames                        |
-| `d`      | Demo mode                                       |
-| `o`      | Browse for a directory                          |
-| `Space`  | Tick or untick the highlighted rename           |
-| `Ctrl+A` | Tick everything                                 |
-| `Ctrl+R` | Untick everything                               |
-| `Tab`    | Move between controls                           |
-| `← →`    | Switch tab, or set the focused option           |
-| `Esc`    | Back to the path field                          |
-| `?`      | Shortcut list                                   |
-| `q`      | Quit                                            |
+Arrow keys drive everything; the vim keys are aliases, not a separate mode.
 
-Single-letter shortcuts type into the path field while it has focus. Press `Tab` or `Esc` to leave
-it, or use `Enter` to preview from there. A successful preview moves focus to the results list, so
-the shortcuts work straight away.
+| Key                  | Vim     | Action                                       |
+| -------------------- | ------- | -------------------------------------------- |
+| `Tab` / `Shift+Tab`  |         | Next / previous control                      |
+| `↑` `↓`              | `k` `j` | Move within a control, and between them      |
+| `←` `→`              | `h` `l` | Set the focused option, or switch tab        |
+| `Home` / `End`       | `g` `G` | First / last row                             |
+| `PgUp` / `PgDn`      | `Ctrl+U` / `Ctrl+D` | A page, or half of one           |
+| `Space`              |         | Tick or untick the highlighted rename        |
+| `Enter`              |         | Preview from the path field, else as `Space` |
+| `Ctrl+A` / `Ctrl+R`  |         | Tick everything / nothing                    |
+| `Esc` / `i`          |         | Leave / enter the path field                 |
+| `p`                  |         | Preview                                      |
+| `a`                  |         | Apply the ticked renames                     |
+| `d`                  |         | Demo mode                                    |
+| `o`                  |         | Browse for a directory                       |
+| `?`                  |         | Shortcut list                                |
+| `q`                  |         | Quit                                         |
+
+The footer always spells out the keys the focused control answers to right now, so nothing above
+has to be memorised.
+
+Single-letter shortcuts type into the path field while it has focus. Press `Tab`, `Esc` or `↓` to
+leave it, or `Enter` to preview from there; a successful preview moves focus to the results list, so
+the verbs work straight away. Inside the field the control keys are the shell's: `Ctrl+A` / `Ctrl+E`
+jump to either end, and `Ctrl+U` / `Ctrl+K` / `Ctrl+W` delete the line, the tail, or one path
+segment.
 
 ### Match level
 

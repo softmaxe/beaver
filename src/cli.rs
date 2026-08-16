@@ -284,14 +284,7 @@ mod tests {
         let cli = Cli::parse_from(["submv", "/tmp", "--level", "cautious"]);
         assert_eq!(cli.plan_options().min_score, MatchLevel::Cautious.score());
 
-        let cli = Cli::parse_from([
-            "submv",
-            "/tmp",
-            "--level",
-            "cautious",
-            "--min-score",
-            "0.5",
-        ]);
+        let cli = Cli::parse_from(["submv", "/tmp", "--level", "cautious", "--min-score", "0.5"]);
         assert_eq!(cli.plan_options().min_score, 0.5);
     }
 
