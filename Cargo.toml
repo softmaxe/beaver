@@ -12,7 +12,7 @@ name = "rename_subtitles"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rename-subs"
+name = "submv"
 path = "src/main.rs"
 
 [dependencies]

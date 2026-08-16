@@ -18,7 +18,7 @@ use crate::presentation::{match_badge, skip_label, MatchLevel};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rename-subs",
+    name = "submv",
     version,
     about = "Rename subtitle files to match the video files beside them.",
     long_about = "Rename subtitle files to match the video files beside them.\n\n\
@@ -281,11 +281,11 @@ mod tests {
 
     #[test]
     fn a_level_maps_onto_a_threshold() {
-        let cli = Cli::parse_from(["rename-subs", "/tmp", "--level", "cautious"]);
+        let cli = Cli::parse_from(["submv", "/tmp", "--level", "cautious"]);
         assert_eq!(cli.plan_options().min_score, MatchLevel::Cautious.score());
 
         let cli = Cli::parse_from([
-            "rename-subs",
+            "submv",
             "/tmp",
             "--level",
             "cautious",
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn extensions_fall_back_to_the_defaults() {
-        let cli = Cli::parse_from(["rename-subs", "/tmp", "--sub-ext", ".ass"]);
+        let cli = Cli::parse_from(["submv", "/tmp", "--sub-ext", ".ass"]);
         let options = cli.plan_options();
         assert_eq!(options.sub_exts, [".ass"]);
         assert_eq!(

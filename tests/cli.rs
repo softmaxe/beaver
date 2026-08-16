@@ -18,7 +18,7 @@ fn library() -> tempfile::TempDir {
 }
 
 fn run(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rename-subs"))
+    Command::new(env!("CARGO_BIN_EXE_submv"))
         .arg(root)
         .args(arguments)
         .output()

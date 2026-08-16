@@ -18,7 +18,7 @@ From the repository root:
 cargo build --release
 ```
 
-The binary lands in `target/release/rename-subs`. To put it on your `PATH`:
+The binary lands in `target/release/submv`. To put it on your `PATH`:
 
 ```bash
 cargo install --path .
@@ -27,13 +27,13 @@ cargo install --path .
 ## Terminal interface
 
 ```bash
-rename-subs
+submv
 ```
 
 Or with a folder already filled in:
 
 ```bash
-rename-subs --tui ~/Videos/Some.Show
+submv --tui ~/Videos/Some.Show
 ```
 
 During development, `cargo run` does the same thing.
@@ -101,7 +101,7 @@ Episode-ID matches ignore the threshold entirely.
 ### Dry run
 
 ```bash
-rename-subs /path/to/folder --dry-run
+submv /path/to/folder --dry-run
 ```
 
 A path with no `--dry-run` or `--apply` is a dry run as well.
@@ -109,7 +109,7 @@ A path with no `--dry-run` or `--apply` is a dry run as well.
 ### Apply renames
 
 ```bash
-rename-subs /path/to/folder --apply --yes
+submv /path/to/folder --apply --yes
 ```
 
 ### Common options
