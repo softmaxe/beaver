@@ -9,9 +9,9 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 
-use rename_subtitles::presentation::MatchLevel;
-use rename_subtitles::tui::app::{App, Focus, Tab};
-use rename_subtitles::tui::ui;
+use submv::presentation::MatchLevel;
+use submv::tui::app::{App, Focus, Tab};
+use submv::tui::ui;
 
 /// Drive the app to a settled state and return what the screen shows.
 struct Harness {

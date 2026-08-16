@@ -1,5 +1,5 @@
 [package]
-name = "rename-subtitles"
+name = "submv"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
@@ -8,7 +8,7 @@ license = "MIT"
 readme = "README.md"
 
 [lib]
-name = "rename_subtitles"
+name = "submv"
 path = "src/lib.rs"
 
 [[bin]]

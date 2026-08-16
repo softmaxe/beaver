@@ -1,4 +1,4 @@
-# rename-subtitles-tui
+# submv
 
 A local tool for matching subtitle filenames (`.ass`, `.srt`, and more) to the video files beside
 them (`.mkv`, `.mp4`, and more). It runs as a terminal interface, with a command-line mode kept for
