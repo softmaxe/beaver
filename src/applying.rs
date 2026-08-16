@@ -198,11 +198,8 @@ pub fn apply_operations(
 }
 
 fn rename(source: &Path, destination: &Path, force: bool) -> Result<(), String> {
-    if target_is_occupied(source, destination) {
-        if !force {
-            return Err(format!("target already exists: {}", file_name(destination)));
-        }
-        fs::remove_file(destination).map_err(|error| error.to_string())?;
+    if !force && target_is_occupied(source, destination) {
+        return Err(format!("target already exists: {}", file_name(destination)));
     }
     if let Some(parent) = destination.parent() {
         if !parent.exists() {
@@ -329,6 +326,33 @@ mod tests {
             fs::read_to_string(root.join("Nebula.S01E01.ass")).unwrap(),
             "subtitle"
         );
+    }
+
+    #[test]
+    fn force_preserves_the_target_when_the_source_is_gone() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let source = root.join("random.S01E01.chs.ass");
+        let destination = root.join("Nebula.S01E01.ass");
+        write(&root.join("Nebula.S01E01.mkv"), "video");
+        write(&source, "subtitle");
+        write(&destination, "already here");
+
+        let plan = plan_directory(
+            root,
+            &PlanOptions {
+                overwrite_existing: true,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        let prepared = prepare_operations(&plan);
+        assert_eq!(prepared.len(), 1);
+        fs::remove_file(source).unwrap();
+
+        let result = apply_operations(&prepared, &plan.root, true, false).unwrap();
+        assert_eq!(result.status(), ApplyStatus::Failed);
+        assert_eq!(fs::read_to_string(destination).unwrap(), "already here");
     }
 
     #[test]

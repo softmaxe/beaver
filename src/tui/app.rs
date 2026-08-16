@@ -311,16 +311,25 @@ impl App {
 
     // ---------------------------------------------------------------------- actions
 
-    /// A preview only describes the options it was generated from.
+    /// Pending scans and previews only describe the options they were generated from.
     fn invalidate_preview(&mut self) {
-        let Some(preview) = self.preview.as_mut() else {
-            return;
-        };
-        if preview.stale {
-            return;
+        let scan_invalidated = self.scanning;
+        if scan_invalidated {
+            // The worker cannot be cancelled, but advancing the generation makes
+            // its eventual answer harmless and frees the UI to preview again.
+            self.generation = self.generation.wrapping_add(1);
+            self.scanning = false;
         }
-        preview.stale = true;
-        self.status = Status::new("Options changed — preview again", StatusKind::Working);
+
+        let preview_invalidated = self.preview.as_mut().is_some_and(|preview| {
+            let was_fresh = !preview.stale;
+            preview.stale = true;
+            was_fresh
+        });
+
+        if scan_invalidated || preview_invalidated {
+            self.status = Status::new("Options changed — preview again", StatusKind::Working);
+        }
     }
 
     pub fn action_preview(&mut self) {
@@ -479,7 +488,11 @@ impl App {
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
+            self.request_quit();
+            return;
+        }
+        if self.applying && matches!(key.code, KeyCode::Char('q')) {
+            self.request_quit();
             return;
         }
         if self.modal.is_some() {
@@ -533,7 +546,7 @@ impl App {
             KeyCode::Char('d') => self.action_demo(),
             KeyCode::Char('o') => self.action_browse(),
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             // A way back to the path field that never risks quitting by accident.
             KeyCode::Esc => self.focus = Focus::Directory,
             KeyCode::Char(' ') | KeyCode::Enter => self.activate(),
@@ -616,6 +629,17 @@ impl App {
         }
         self.level = level;
         self.invalidate_preview();
+    }
+
+    fn request_quit(&mut self) {
+        if self.applying {
+            self.status = Status::new(
+                "Applying… wait for it to finish before quitting",
+                StatusKind::Working,
+            );
+        } else {
+            self.should_quit = true;
+        }
     }
 
     fn move_in_results(&mut self, delta: isize) {
@@ -709,5 +733,65 @@ fn plural(count: usize, one: &str, many: &str) -> String {
         one.into()
     } else {
         many.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type ConfigurationChange = (&'static str, fn(&mut App));
+
+    fn app_with_queued_scan() -> App {
+        let mut app = App::new();
+        app.generation = 7;
+        app.scanning = true;
+        app.sender
+            .send(Update::Scanned {
+                generation: app.generation,
+                result: Ok(demo_plan()),
+            })
+            .unwrap();
+        app
+    }
+
+    fn edit_directory(app: &mut App) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    }
+
+    fn toggle_recursive(app: &mut App) {
+        app.focus = Focus::Recursive;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    }
+
+    fn toggle_strict(app: &mut App) {
+        app.focus = Focus::Strict;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    }
+
+    fn change_level(app: &mut App) {
+        app.focus = Focus::Level;
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn configuration_changes_reject_an_in_flight_scan_result() {
+        let changes: [ConfigurationChange; 4] = [
+            ("directory", edit_directory),
+            ("recursive", toggle_recursive),
+            ("strict", toggle_strict),
+            ("level", change_level),
+        ];
+
+        for (name, change) in changes {
+            let mut app = app_with_queued_scan();
+            change(&mut app);
+
+            assert!(!app.scanning, "{name} left the obsolete scan active");
+            app.poll_workers();
+            assert!(app.preview.is_none(), "{name} accepted the obsolete plan");
+            assert!(!app.can_apply(), "{name} made the obsolete plan applicable");
+            assert_eq!(app.status.text, "Options changed — preview again");
+        }
     }
 }

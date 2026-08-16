@@ -115,6 +115,42 @@ fn refuses_to_overwrite_without_force() {
 }
 
 #[test]
+fn force_overwrites_the_plain_target() {
+    let temporary = library();
+    let root = temporary.path();
+    let target = root.join("Nebula.Archive.S01E01.1080p.ass");
+    fs::write(&target, b"already here").unwrap();
+
+    let output = run(root, &["--apply", "--yes", "--force"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("->  Nebula.Archive.S01E01.1080p.ass"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(target).unwrap(), "subtitle");
+    assert!(!root
+        .join("[Group] Nebula Archive - S01E01.chs.ass")
+        .exists());
+}
+
+#[test]
+fn strict_and_force_are_mutually_exclusive() {
+    let temporary = library();
+    let root = temporary.path();
+    let source = root.join("[Group] Nebula Archive - S01E01.chs.ass");
+
+    let output = run(root, &["--apply", "--yes", "--strict", "--force"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(source.exists());
+    assert!(!root.join("Nebula.Archive.S01E01.1080p.ass").exists());
+}
+
+#[test]
 fn rejects_a_path_that_is_not_a_directory() {
     let temporary = library();
     let output = run(&temporary.path().join("Unrelated.Bonus.srt"), &[]);

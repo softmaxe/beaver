@@ -53,7 +53,7 @@ pub struct Cli {
     pub min_score: Option<f64>,
 
     /// Skip any subtitle whose target name is already taken.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "force")]
     pub strict: bool,
 
     /// Show the planned renames without changing anything. The default.
@@ -69,7 +69,7 @@ pub struct Cli {
     pub yes: bool,
 
     /// Allow overwriting existing files. Dangerous, and CLI-only.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "strict")]
     pub force: bool,
 }
 
@@ -96,6 +96,7 @@ impl Cli {
         PlanOptions {
             recursive: self.recursive,
             strict: self.strict,
+            overwrite_existing: self.force,
             min_score: self
                 .min_score
                 .unwrap_or_else(|| MatchLevel::from(self.level).score()),

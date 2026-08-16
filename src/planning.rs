@@ -36,6 +36,8 @@ pub enum MatchReason {
 pub enum SkipReason {
     /// No video scored high enough, or two scored too close together.
     Unmatched { best_score: f64 },
+    /// No video carries the episode id found in the subtitle filename.
+    NoMatchingEpisode(String),
     /// Several videos in the folder claim the same episode id.
     AmbiguousEpisode(String),
     /// The subtitle is already named after its video.
@@ -77,6 +79,8 @@ pub struct PlanOptions {
     pub recursive: bool,
     /// Refuse any subtitle that cannot take the plain `VideoName.ext` form.
     pub strict: bool,
+    /// Allow the plain target name to replace a file already on disk.
+    pub overwrite_existing: bool,
     /// Fuzzy threshold in `0.0..=1.0`; episode-id matches ignore it.
     pub min_score: f64,
     pub video_exts: Vec<String>,
@@ -88,6 +92,7 @@ impl Default for PlanOptions {
         Self {
             recursive: false,
             strict: false,
+            overwrite_existing: false,
             min_score: crate::presentation::MatchLevel::default().score(),
             video_exts: VIDEO_EXTS_DEFAULT
                 .iter()
@@ -390,13 +395,17 @@ fn build_directory_plan(
             }
         }
 
-        let by_episode = episode.and_then(|key| {
-            videos_by_episode
-                .get(key)
-                .map(|video| (*video, MatchReason::Episode(key.to_string())))
-        });
-        let (video, reason) = match by_episode {
-            Some(matched) => matched,
+        let (video, reason) = match episode {
+            Some(key) => match videos_by_episode.get(key) {
+                Some(video) => (*video, MatchReason::Episode(key.to_string())),
+                None => {
+                    skipped.push(SkippedRename {
+                        path: subtitle.path.clone(),
+                        reason: SkipReason::NoMatchingEpisode(key.to_string()),
+                    });
+                    continue;
+                }
+            },
             None => match choose_unique_best(subtitle, videos, options.min_score) {
                 (Some(video), score) => (video, MatchReason::Fuzzy(score)),
                 (None, best_score) => {
@@ -409,9 +418,14 @@ fn build_directory_plan(
             },
         };
 
-        let Some(destination) =
-            choose_destination(subtitle, video, options.strict, path_exists, &planned)
-        else {
+        let Some(destination) = choose_destination(
+            subtitle,
+            video,
+            options.strict,
+            options.overwrite_existing,
+            path_exists,
+            &planned,
+        ) else {
             skipped.push(SkippedRename {
                 path: subtitle.path.clone(),
                 reason: if options.strict {
@@ -449,6 +463,7 @@ fn choose_destination(
     subtitle: &Candidate,
     video: &Candidate,
     strict: bool,
+    overwrite_existing: bool,
     path_exists: &dyn Fn(&Path) -> bool,
     planned: &HashSet<PathBuf>,
 ) -> Option<PathBuf> {
@@ -465,7 +480,9 @@ fn choose_destination(
     if base == subtitle.path {
         return Some(base);
     }
-    let taken = |candidate: &Path| path_exists(candidate) || planned.contains(candidate);
+    let taken = |candidate: &Path| {
+        planned.contains(candidate) || (!overwrite_existing && path_exists(candidate))
+    };
     if !taken(&base) {
         return Some(base);
     }
@@ -560,6 +577,7 @@ mod tests {
     fn matches_on_episode_id() {
         let plan = plan(&[
             "Nebula.S01E01.1080p.mkv",
+            "some.other.release.S01E02.mkv",
             "some.other.release.S01E01.chs.ass",
         ]);
         assert_eq!(destinations(&plan), ["Nebula.S01E01.1080p.ass"]);
@@ -567,9 +585,20 @@ mod tests {
             plan.operations[0].reason,
             MatchReason::Episode("S01E01".into())
         );
-        assert_eq!(plan.video_count, 1);
+        assert_eq!(plan.video_count, 2);
         assert_eq!(plan.subtitle_count, 1);
         assert_eq!(plan.directory_count, 1);
+    }
+
+    #[test]
+    fn does_not_fuzzy_match_when_episode_id_has_no_matching_video() {
+        let plan = plan(&["Nebula.S01E01.mkv", "Nebula.S01E02.srt"]);
+
+        assert!(plan.operations.is_empty());
+        assert_eq!(
+            plan.skipped[0].reason,
+            SkipReason::NoMatchingEpisode("S01E02".into())
+        );
     }
 
     #[test]
@@ -670,6 +699,49 @@ mod tests {
         );
         assert_eq!(plan.operations.len(), 1);
         assert_eq!(plan.skipped[0].reason, SkipReason::StrictCollision);
+    }
+
+    #[test]
+    fn overwrite_existing_uses_the_plain_target() {
+        let plan = plan_with(
+            &[
+                "Nebula.S01E01.mkv",
+                "Nebula.S01E01.srt",
+                "Other.Release.S01E01.chs.srt",
+            ],
+            PlanOptions {
+                overwrite_existing: true,
+                ..PlanOptions::default()
+            },
+        );
+
+        assert_eq!(destinations(&plan), ["Nebula.S01E01.srt"]);
+        assert_eq!(
+            plan.operations[0].source.file_name().unwrap(),
+            "Other.Release.S01E01.chs.srt"
+        );
+    }
+
+    #[test]
+    fn overwrite_existing_keeps_planned_targets_unique() {
+        let plan = plan_with(
+            &[
+                "Nebula.S01E01.mkv",
+                "A.Release.S01E01.chs.srt",
+                "B.Release.S01E01.eng.srt",
+            ],
+            PlanOptions {
+                overwrite_existing: true,
+                ..PlanOptions::default()
+            },
+        );
+
+        let destinations = destinations(&plan);
+        assert_eq!(destinations, ["Nebula.S01E01.srt", "Nebula.S01E01.eng.srt"]);
+        assert_eq!(
+            destinations.iter().collect::<HashSet<_>>().len(),
+            destinations.len()
+        );
     }
 
     #[test]

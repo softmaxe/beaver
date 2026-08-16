@@ -260,3 +260,27 @@ fn quits_on_q_and_on_control_c() {
     harness.press_control(KeyCode::Char('c'));
     assert!(harness.app.should_quit);
 }
+
+#[test]
+fn quit_keys_wait_for_an_apply_to_finish() {
+    let temporary = tempfile::tempdir().unwrap();
+
+    let mut harness = Harness::new(temporary.path());
+    harness.app.applying = true;
+    harness.app.focus = Focus::Results;
+    harness.press(KeyCode::Char('q'));
+    assert!(!harness.app.should_quit);
+    assert_eq!(
+        harness.app.status.text,
+        "Applying… wait for it to finish before quitting"
+    );
+
+    let mut harness = Harness::new(temporary.path());
+    harness.app.applying = true;
+    harness.press_control(KeyCode::Char('c'));
+    assert!(!harness.app.should_quit);
+    assert_eq!(
+        harness.app.status.text,
+        "Applying… wait for it to finish before quitting"
+    );
+}

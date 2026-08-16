@@ -91,6 +91,7 @@ pub fn skip_label(reason: &SkipReason) -> String {
         SkipReason::Unmatched { best_score } => {
             format!("No matching video (best {best_score:.2})")
         }
+        SkipReason::NoMatchingEpisode(key) => format!("No video with episode {key}"),
         SkipReason::AmbiguousEpisode(key) => format!("Two videos claim {key}"),
         SkipReason::AlreadyMatches => "Filename already matches".into(),
         SkipReason::StrictCollision => "Target name taken (strict mode)".into(),
@@ -142,6 +143,10 @@ mod tests {
             "episode S01E02"
         );
         assert_eq!(match_badge(&MatchReason::Fuzzy(0.8765)), "fuzzy 0.88");
+        assert_eq!(
+            skip_label(&SkipReason::NoMatchingEpisode("S01E02".into())),
+            "No video with episode S01E02"
+        );
         assert_eq!(
             skip_label(&SkipReason::AlreadyMatches),
             "Filename already matches"
