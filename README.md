@@ -143,7 +143,7 @@ Demo mode shows the workflow but never writes anything. To try a real apply on f
 matter, generate a throwaway library:
 
 ```bash
-scripts/make-demo-library.sh          # creates ./demo-library
+scripts/make-demo-library.sh          # creates demo-library/ at the repository root
 cargo run -- --tui demo-library       # then turn on "include subfolders" and press p
 ```
 
@@ -154,7 +154,8 @@ subtitles with no video beside them. Stepping the match level or flipping the st
 changes the plan.
 
 Renaming mutates the folder, so re-run the script for a clean slate. It only ever writes to a
-directory it created itself, and `rm -rf demo-library` removes it.
+directory it created itself, `.gitignore` keeps it out of the repository, and `rm -rf demo-library`
+removes it. Pass a path to put it somewhere else.
 
 ## Layout
 

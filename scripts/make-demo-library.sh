@@ -7,7 +7,8 @@
 # so the whole workflow — preview, tick, strict, subfolders, match level, apply —
 # can be exercised against one folder.
 #
-# Usage: scripts/make-demo-library.sh [target-directory]   (default: ./demo-library)
+# Usage: scripts/make-demo-library.sh [target-directory]
+#        (default: demo-library/ at the repository root, which git ignores)
 #
 # Renaming mutates the library, so re-run this to get a clean slate. Only a
 # directory this script created before (it leaves a .demo-library marker) or a
@@ -15,7 +16,9 @@
 
 set -euo pipefail
 
-target=${1:-demo-library}
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+target=${1:-$repo_root/demo-library}
 marker=$target/.demo-library
 
 if [[ -e $target ]]; then
