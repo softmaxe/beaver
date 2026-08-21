@@ -1,4 +1,4 @@
-# submv
+# beaver
 
 A local tool for matching subtitle filenames (`.ass`, `.srt`, and more) to the video files beside
 them (`.mkv`, `.mp4`, and more). It runs as a terminal interface, with a command-line mode kept for
@@ -18,7 +18,7 @@ From the repository root:
 cargo build --release
 ```
 
-The binary lands in `target/release/submv`. To put it on your `PATH`:
+The binary lands in `target/release/beaver`. To put it on your `PATH`:
 
 ```bash
 cargo install --path .
@@ -27,13 +27,13 @@ cargo install --path .
 ## Terminal interface
 
 ```bash
-submv
+beaver
 ```
 
 Or with a folder already filled in:
 
 ```bash
-submv --tui ~/Videos/Some.Show
+beaver --tui ~/Videos/Some.Show
 ```
 
 During development, `cargo run` does the same thing.
@@ -110,7 +110,7 @@ Episode-ID matches ignore the threshold entirely.
 ### Dry run
 
 ```bash
-submv /path/to/folder --dry-run
+beaver /path/to/folder --dry-run
 ```
 
 A path with no `--dry-run` or `--apply` is a dry run as well.
@@ -118,7 +118,7 @@ A path with no `--dry-run` or `--apply` is a dry run as well.
 ### Apply renames
 
 ```bash
-submv /path/to/folder --apply --yes
+beaver /path/to/folder --apply --yes
 ```
 
 ### Common options

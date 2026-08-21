@@ -1,6 +1,6 @@
 # Design specification — terminal interface
 
-This document describes how `submv` looks and behaves in a terminal.
+This document describes how `beaver` looks and behaves in a terminal.
 
 The guiding constraint: a terminal has no shadows, no gradients, no hover states, and a grid of
 character cells instead of pixels. Hierarchy has to come from **position, weight, and a small

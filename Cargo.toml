@@ -1,5 +1,5 @@
 [package]
-name = "submv"
+name = "beaver"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
@@ -8,11 +8,11 @@ license = "MIT"
 readme = "README.md"
 
 [lib]
-name = "submv"
+name = "beaver"
 path = "src/lib.rs"
 
 [[bin]]
-name = "submv"
+name = "beaver"
 path = "src/main.rs"
 
 [dependencies]

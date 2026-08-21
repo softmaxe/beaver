@@ -9,9 +9,9 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 
-use submv::presentation::MatchLevel;
-use submv::tui::app::{App, Focus, Tab};
-use submv::tui::ui;
+use beaver::presentation::MatchLevel;
+use beaver::tui::app::{App, Focus, Tab};
+use beaver::tui::ui;
 
 /// Drive the app to a settled state and return what the screen shows.
 struct Harness {

@@ -18,7 +18,7 @@ fn library() -> tempfile::TempDir {
 }
 
 fn run(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_submv"))
+    Command::new(env!("CARGO_BIN_EXE_beaver"))
         .arg(root)
         .args(arguments)
         .output()

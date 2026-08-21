@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
+use beaver::cli::{run, Cli};
 use clap::Parser;
-use submv::cli::{run, Cli};
 
 fn main() -> ExitCode {
     run(Cli::parse())
