@@ -17,7 +17,8 @@ would double the surface area of "what does this colour mean" for no gain in a t
 | `BACKGROUND`           | Base         | `#1e1e2e` | The page floor                             |
 | `SURFACE`              | Mantle       | `#181825` | Setup column, result panes                 |
 | `PANEL`                | Crust        | `#11111b` | Modal dialogs, header and footer bars      |
-| `SELECTION_BACKGROUND` | Surface 0    | `#313244` | The row the cursor is on                   |
+| `SELECTION_BACKGROUND` | Surface 0    | `#313244` | The row the cursor or pointer is on        |
+| `HOVER`                | Surface 1    | `#45475a` | A filled control under the pointer         |
 | `BORDER`               | Surface 1    | `#45475a` | Resting borders                            |
 | `FAINT`                | Overlay 1    | `#7f849c` | Fuzzy scores, hints, disabled controls     |
 | `MUTED`                | Subtext 0    | `#a6adc8` | Secondary text, the detail line            |
@@ -94,7 +95,7 @@ to do one job:
 | Skipped subtitles   | `ratatui::Table`, source and reason             | Read-only tabular data with no selection semantics.                   |
 | Confirmation        | A modal that spells out five examples           | The last stop before anything on disk is touched.                     |
 | Summary             | One line of counts                              | Four numbers do not need four boxes in a terminal.                    |
-| Buttons             | Full-width filled bars, keyed `p` / `a` / `d`   | The key that triggers them is printed on them, so the footer is a reminder rather than the only route. |
+| Buttons             | `Label (key)`, filled, spaced apart             | The label says what happens and the key that does it follows in brackets, so the footer is a reminder rather than the only route. |
 
 Focus is shown one way and one way only: the focused row takes `SELECTION_BACKGROUND` and its label
 goes bold, and the results pane's border turns mauve when the list holds the keyboard.
@@ -109,7 +110,8 @@ A matched row reads `[✓] source → target  badge`, with the badge pushed to t
   user should actually look at.
 
 Long paths are trimmed from the left, keeping the filename, because that is the end that identifies
-the file. The detail line under the list always spells the highlighted row out in full.
+the file. The detail line under the list always spells the highlighted row out in full; status shares
+the global footer with the focus-specific keyboard hints instead of taking another row.
 
 ## Interaction rules
 
@@ -123,6 +125,18 @@ the file. The detail line under the list always spells the highlighted row out i
   overwriting a newer preview.
 - **The whole batch or nothing.** Every path is fingerprinted when the preview is built and checked
   again immediately before renaming; any drift refuses the entire apply.
+- **The mouse points, the keyboard drives.** Mouse capture is always on: moving the pointer tints
+  whatever is clickable with `SELECTION_BACKGROUND` — never bold, never mauve — and a left click
+  focuses, selects, toggles or activates exactly what it landed on, with a second click on an
+  already-selected row acting on it. A filled button carries its tint in the fill instead, stepping
+  one place up the same ramp under the pointer — `SELECTION_BACKGROUND` to `HOVER`, mauve to
+  lavender, green to teal. The wheel scrolls whichever list is on top. Copying text stays with the
+  terminal's shift-drag.
+- **Nothing is reachable by keyboard alone.** Every action has a button or a clickable strip: the
+  three workflow buttons and the browser in the setup column, `Help` and `Quit` in the header,
+  `Tick all` / `Tick none` on the results border, and a button row in each dialog — the picker's
+  `Parent folder` / `Use this folder` / `Cancel`, the confirmation's `Apply` / `Cancel`, the help
+  modal's `Close`. A key is always a shortcut for something visible, never the only way in.
 
 ## Keyboard
 
@@ -130,6 +144,9 @@ The full table lives in `README.md` and in the `?` modal. Four rules govern it:
 
 - Single-letter keys for the workflow verbs (`p`, `a`, `d`, `o`), `Ctrl`-modified for the bulk
   selection operations, and `?` / `q` for the interface itself.
+- **The footer names only keys that are not printed elsewhere on screen.** Every verb has a button
+  carrying its own key, and the two bulk chords sit on the results border, so repeating any of them
+  along the bottom edge would just be a second copy of the screen.
 - Single-letter keys necessarily type into a focused text field. Rather than fight that with
   priority bindings — which would make paths untypeable — `Enter` submits the path field, `Esc`
   leaves it, and focus moves to the results list after a successful preview so the verbs work

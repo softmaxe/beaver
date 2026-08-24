@@ -6,11 +6,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use beaver::presentation::MatchLevel;
-use beaver::tui::app::{App, Focus, Tab};
+use beaver::tui::app::{App, Focus, Hit, Tab};
 use beaver::tui::ui;
 
 /// Drive the app to a settled state and return what the screen shows.
@@ -34,6 +37,46 @@ impl Harness {
     fn press_control(&mut self, code: KeyCode) {
         self.app
             .handle_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+    }
+
+    /// The rectangle the last drawn frame registered for `hit`.
+    fn rect_for(&self, hit: Hit) -> Rect {
+        self.app
+            .hits
+            .iter()
+            .find(|(_, found)| *found == hit)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("{hit:?} is not on screen"))
+    }
+
+    fn mouse(&mut self, kind: MouseEventKind, hit: Hit) {
+        self.draw();
+        let rect = self.rect_for(hit);
+        self.app.handle_mouse(MouseEvent {
+            kind,
+            column: rect.x + rect.width / 2,
+            row: rect.y + rect.height / 2,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn click(&mut self, hit: Hit) {
+        self.mouse(MouseEventKind::Down(MouseButton::Left), hit);
+    }
+
+    fn hover(&mut self, hit: Hit) {
+        self.mouse(MouseEventKind::Moved, hit);
+    }
+
+    /// A wheel notch over the middle of the screen.
+    fn wheel(&mut self, kind: MouseEventKind) {
+        self.draw();
+        self.app.handle_mouse(MouseEvent {
+            kind,
+            column: 60,
+            row: 16,
+            modifiers: KeyModifiers::NONE,
+        });
     }
 
     /// Wait for a worker thread to report back, then redraw.
@@ -161,6 +204,7 @@ fn previews_ticks_and_applies() {
     assert!(screen.contains("episode S01E01"), "{screen}");
     assert!(screen.contains("2 of 2 ticked"), "{screen}");
     assert!(screen.contains("Preview ready"), "{screen}");
+    assert!(harness.footer().contains("Preview ready"));
     // A successful preview hands the keyboard to the results, so the workflow
     // shortcuts work without pressing anything else first.
     assert_eq!(harness.app.focus, Focus::Results);
@@ -293,7 +337,10 @@ fn the_layout_survives_a_small_terminal() {
 
     let screen = harness.screen();
     assert!(screen.contains("To rename (2)"), "{screen}");
-    assert!(screen.contains("p preview"), "{screen}");
+    assert!(screen.contains("space tick"), "{screen}");
+    for action in ["p preview", "a apply", "d demo"] {
+        assert!(harness.footer().contains(action), "{screen}");
+    }
     // Stacked, not side by side: the setup column keeps the full width.
     assert!(
         screen
@@ -1084,26 +1131,30 @@ fn the_footer_names_the_keys_that_the_focused_control_answers_to() {
     let footer = harness.footer();
     assert!(footer.contains("space tick"), "{footer}");
     assert!(footer.contains("←→ tabs"), "{footer}");
-    // The whole list fits at this width; the narrow case below is what trims it.
-    assert!(footer.contains("d demo"), "{footer}");
+
+    // The verbs are not repeated here: each one is a button with its own key
+    // printed on it, and the two chords sit on the results border.
+    for repeated in ["p preview", "a apply", "d demo", "^a all", "^r none"] {
+        assert!(!footer.contains(repeated), "{repeated} in {footer}");
+    }
+    assert!(harness.screen().contains("Demo mode (d)"));
 }
 
 #[test]
 fn the_footer_drops_its_least_important_hints_before_help_and_quit() {
     let temporary = tempfile::tempdir().unwrap();
     let mut harness = Harness::new(temporary.path());
-    harness.terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    harness.terminal = Terminal::new(TestBackend::new(30, 24)).unwrap();
     harness.press(KeyCode::Esc);
     assert_eq!(harness.app.focus, Focus::Results);
     harness.draw();
 
-    // The results have the longest hint list, so this is where the line has to
-    // give: the tail goes first and the two escape hatches always stay.
+    // The line has to give somewhere: the tail goes first and the two escape
+    // hatches always stay.
     let footer = harness.footer();
     assert!(footer.contains("? help"), "{footer}");
     assert!(footer.contains("q quit"), "{footer}");
-    assert!(footer.contains("space tick"), "{footer}");
-    assert!(!footer.contains("d demo"), "{footer}");
+    assert!(!footer.contains("←→ tabs"), "{footer}");
 }
 
 #[test]
@@ -1147,5 +1198,283 @@ fn the_directory_picker_takes_the_vim_keys_and_space() {
         harness.app.directory.value().ends_with("season 3"),
         "{}",
         harness.app.directory.value()
+    );
+}
+
+#[test]
+fn clicking_a_row_selects_it_and_clicking_again_ticks_it() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+    assert!(harness.screen().contains("2 of 2 ticked"));
+
+    // The first click moves the selection without touching any tick.
+    harness.click(Hit::MatchedRow(1));
+    assert_eq!(harness.app.focus, Focus::Results);
+    {
+        let preview = harness.app.preview.as_ref().unwrap();
+        assert_eq!(preview.matched_state.selected(), Some(1));
+        assert!(preview.ticked[1]);
+    }
+
+    // The second click, on the row you are already on, unticks it.
+    harness.click(Hit::MatchedRow(1));
+    assert!(!harness.app.preview.as_ref().unwrap().ticked[1]);
+    harness.draw();
+    assert!(harness.screen().contains("1 of 2 ticked"));
+}
+
+#[test]
+fn hovering_tints_a_row_without_moving_the_keyboard() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+
+    harness.hover(Hit::MatchedRow(1));
+    harness.draw();
+    // The tint is the palette's own selection background, and the pointer
+    // changes nothing about focus or which row is selected.
+    let rect = harness.rect_for(Hit::MatchedRow(1));
+    let buffer = harness.terminal.backend().buffer();
+    assert_eq!(
+        buffer[(rect.x + 2, rect.y)].bg,
+        ratatui::style::Color::Rgb(0x31, 0x32, 0x44)
+    );
+    assert_eq!(
+        harness.app.preview.unwrap().matched_state.selected(),
+        Some(0)
+    );
+}
+
+#[test]
+fn clicking_the_controls_toggles_previews_and_switches_tabs() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+
+    // The recursive switch flips, takes the keyboard, and stales the preview.
+    harness.click(Hit::Recursive);
+    assert!(harness.app.recursive);
+    assert_eq!(harness.app.focus, Focus::Recursive);
+    assert!(!harness.app.can_apply());
+    harness.draw();
+    assert!(harness.screen().contains("Options changed — preview again"));
+
+    // The disabled apply button rests on the selection background, so under
+    // the pointer it steps up to the hover surface instead.
+    harness.hover(Hit::ApplyButton);
+    harness.draw();
+    let rect = harness.rect_for(Hit::ApplyButton);
+    let buffer = harness.terminal.backend().buffer();
+    assert_eq!(
+        buffer[(rect.x + 2, rect.y)].bg,
+        ratatui::style::Color::Rgb(0x45, 0x47, 0x5a)
+    );
+
+    // The preview button does what p does.
+    harness.click(Hit::PreviewButton);
+    harness.settle(fresh_preview);
+    assert!(harness.app.can_apply());
+
+    // A tab chip switches panes.
+    harness.click(Hit::Tab(Tab::Skipped));
+    assert_eq!(harness.app.tab, Tab::Skipped);
+    assert_eq!(harness.app.focus, Focus::Results);
+    harness.draw();
+    assert!(harness.screen().contains("Unrelated.Bonus.srt"));
+
+    // The browse button under the path field opens the picker, the same as o.
+    harness.click(Hit::BrowseButton);
+    assert!(matches!(
+        harness.app.modal,
+        Some(beaver::tui::app::Modal::Picker(_))
+    ));
+}
+
+#[test]
+fn clicking_the_picker_selects_then_descends() {
+    let temporary = picker_library();
+    let mut harness = Harness::new(temporary.path());
+    harness.press(KeyCode::Esc);
+    harness.press(KeyCode::Char('o'));
+
+    // The listing opens with the first folder already highlighted, so a single
+    // click descends into it.
+    harness.click(Hit::PickerRow(0));
+    {
+        let Some(beaver::tui::app::Modal::Picker(picker)) = harness.app.modal.as_ref() else {
+            panic!("picker closed");
+        };
+        assert!(
+            picker.current.ends_with("season 1"),
+            "{}",
+            picker.current.display()
+        );
+    }
+
+    // Back up to the root, where the highlight starts on the wrong folder:
+    // the first click selects, the second descends.
+    harness.press(KeyCode::Char('h'));
+    harness.click(Hit::PickerRow(2));
+    let Some(beaver::tui::app::Modal::Picker(picker)) = harness.app.modal.as_ref() else {
+        panic!("picker closed");
+    };
+    assert_eq!(picker.state.selected(), Some(2));
+    assert!(picker
+        .current
+        .ends_with(temporary.path().file_name().unwrap()));
+
+    harness.click(Hit::PickerRow(2));
+    let Some(beaver::tui::app::Modal::Picker(picker)) = harness.app.modal.as_ref() else {
+        panic!("picker closed");
+    };
+    assert!(
+        picker.current.ends_with("season 3"),
+        "{}",
+        picker.current.display()
+    );
+}
+
+/// Every step of the workflow has to be reachable without touching a key: the
+/// picker's own buttons, the confirmation, the bulk ticks, help and quit.
+#[test]
+fn the_whole_workflow_can_be_driven_by_the_mouse_alone() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+    harness.draw();
+
+    // Browse, walk up a level, then take the folder that is showing.
+    harness.click(Hit::BrowseButton);
+    harness.click(Hit::PickerParent);
+    harness.click(Hit::PickerUse);
+    assert!(harness.app.modal.is_none());
+    let chosen = harness.app.directory.value().trim().to_string();
+    assert!(
+        temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .starts_with(&chosen)
+            && Path::new(&chosen) != temporary.path(),
+        "{chosen}"
+    );
+
+    // Cancel backs out without touching the path.
+    harness.click(Hit::BrowseButton);
+    harness.click(Hit::PickerCancel);
+    assert!(harness.app.modal.is_none());
+
+    harness
+        .app
+        .directory
+        .set_value(&temporary.path().to_string_lossy());
+    harness.click(Hit::PreviewButton);
+    harness.settle(fresh_preview);
+
+    // The chips on the results border tick every row and none of them.
+    harness.click(Hit::TickNone);
+    assert_eq!(harness.app.preview.as_ref().unwrap().ticked_count(), 0);
+    assert!(!harness.app.can_apply());
+    harness.click(Hit::TickAll);
+    assert_eq!(harness.app.preview.as_ref().unwrap().ticked_count(), 2);
+
+    // Apply asks first, and the dialog answers to its own buttons.
+    harness.click(Hit::ApplyButton);
+    harness.click(Hit::ConfirmCancel);
+    assert!(harness.app.modal.is_none());
+    assert!(temporary
+        .path()
+        .join("[Group] Nebula Archive - S01E01.chs.ass")
+        .exists());
+
+    harness.click(Hit::ApplyButton);
+    harness.click(Hit::ConfirmApply);
+    harness.settle(|app| !app.applying);
+    assert!(temporary
+        .path()
+        .join("Nebula.Archive.S01E01.1080p.ass")
+        .exists());
+
+    // Help opens and closes from the header and its own button.
+    harness.click(Hit::HelpButton);
+    assert!(matches!(
+        harness.app.modal,
+        Some(beaver::tui::app::Modal::Help)
+    ));
+    harness.click(Hit::HelpClose);
+    assert!(harness.app.modal.is_none());
+
+    harness.click(Hit::QuitButton);
+    assert!(harness.app.should_quit);
+}
+
+/// A short terminal cannot show the whole setup column, and the keyboard only
+/// scrolls it by moving the focus — which a pointer cannot do. Without a wheel
+/// over the column the action buttons are simply unreachable by mouse.
+#[test]
+fn the_wheel_reaches_the_setup_buttons_in_a_short_terminal() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+    harness.terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    harness.draw();
+
+    // The column opens on the path field, so the buttons are off the bottom.
+    assert!(!harness.screen().contains("Preview (p)"));
+
+    // The wheel over the setup panel brings them up.
+    let setup = harness.app.setup_area;
+    for _ in 0..4 {
+        harness.app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: setup.x + setup.width / 2,
+            row: setup.y + setup.height / 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        harness.draw();
+    }
+    let screen = harness.screen();
+    assert!(screen.contains("Preview (p)"), "{screen}");
+
+    // And it is a live target, not just painted.
+    harness.click(Hit::PreviewButton);
+    harness.settle(fresh_preview);
+    assert!(harness.app.can_apply());
+}
+
+/// The wheel moves the highlight in whichever list is on top.
+#[test]
+fn the_wheel_scrolls_the_results_and_the_picker() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+
+    harness.wheel(MouseEventKind::ScrollDown);
+    assert_eq!(
+        harness
+            .app
+            .preview
+            .as_ref()
+            .unwrap()
+            .matched_state
+            .selected(),
+        Some(1)
+    );
+    harness.wheel(MouseEventKind::ScrollUp);
+    assert_eq!(
+        harness
+            .app
+            .preview
+            .as_ref()
+            .unwrap()
+            .matched_state
+            .selected(),
+        Some(0)
     );
 }

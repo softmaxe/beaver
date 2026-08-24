@@ -58,8 +58,21 @@ pub const DEMO: Color = PEACH;
 pub const ERROR: Color = RED;
 /// The row the cursor is on.
 pub const SELECTION_BACKGROUND: Color = SURFACE0;
+/// The pointer is over a filled control: one surface step up from resting.
+pub const HOVER: Color = SURFACE1;
 /// A ticked checkbox.
 pub const TICK: Color = GREEN;
+
+/// The fill a button takes under the pointer: the next step up the same ramp,
+/// so every button answers a hover rather than only the quiet ones.
+pub fn hovered_fill(background: Color) -> Color {
+    match background {
+        SELECTION_BACKGROUND => HOVER,
+        FOCUS => LAVENDER,
+        SUCCESS => TEAL,
+        other => other,
+    }
+}
 
 pub fn base() -> Style {
     Style::default().fg(FOREGROUND).bg(BACKGROUND)

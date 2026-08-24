@@ -5,7 +5,7 @@
 //! that split is what makes the three-step workflow legible without numbering the
 //! steps. Below 100 columns the two panes cannot sit side by side, so they stack.
 
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -18,7 +18,7 @@ use crate::applying::PreparedOperation;
 use crate::paths::display_path;
 use crate::planning::{MatchReason, RenamePlan};
 use crate::presentation::{match_badge, skip_label, MatchLevel};
-use crate::tui::app::{App, Focus, Modal, StatusKind, Tab};
+use crate::tui::app::{App, Focus, Hit, Modal, StatusKind, Tab};
 use crate::tui::theme;
 
 /// Narrower than this, the setup column and the results cannot share a row.
@@ -27,6 +27,7 @@ const SETUP_WIDTH: u16 = 38;
 const SPINNER: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.hits.clear();
     let area = frame.area();
     frame.render_widget(Block::new().style(theme::base()), area);
 
@@ -37,7 +38,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
-    draw_header(frame, header_area);
+    draw_header(frame, header_area, app.hover, &mut app.hits);
     if body_area.width >= WIDE_LAYOUT_MINIMUM {
         let [setup_area, results_area] =
             Layout::horizontal([Constraint::Length(SETUP_WIDTH), Constraint::Min(20)])
@@ -56,45 +57,96 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_footer(frame, app, footer_area);
 
+    let hover = app.hover;
     match app.modal.as_mut() {
-        Some(Modal::Help) => draw_help(frame, area),
-        Some(Modal::Confirm { count, examples }) => draw_confirm(frame, area, *count, examples),
-        Some(Modal::Picker(picker)) => draw_picker(frame, area, picker),
+        Some(Modal::Help) => draw_help(frame, area, hover, &mut app.hits),
+        Some(Modal::Confirm { count, examples }) => {
+            draw_confirm(frame, area, *count, examples, hover, &mut app.hits)
+        }
+        Some(Modal::Picker(picker)) => draw_picker(frame, area, picker, hover, &mut app.hits),
         None => {}
     }
 }
 
-// ------------------------------------------------------------------ chrome
-
-fn draw_header(frame: &mut Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(" Subtitle Renamer ", theme::heading()),
-        Span::styled(
-            "· align subtitle filenames with the videos beside them",
-            theme::faint(),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme::PANEL)),
-        area,
-    );
+/// Whether the pointer rests on `rect`, for the hover tint.
+fn hovered(hover: Option<Position>, rect: Rect) -> bool {
+    hover.is_some_and(|point| rect.contains(point))
 }
 
-/// The keys the focused control answers to, then the two that always apply.
+// ------------------------------------------------------------------ chrome
+
+fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    hover: Option<Position>,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    // Help and quit are otherwise keys and nothing else, which leaves a pointer
+    // with no way to reach either of them, so they take the end of the bar and
+    // the tagline gives way rather than being written over.
+    const TITLE: &str = " Subtitle Renamer ";
+    const TAGLINE: &str = "· align subtitle filenames with the videos beside them";
+    let chips = [
+        (Hit::HelpButton, " Help (?) "),
+        (Hit::QuitButton, " Quit (q) "),
+    ];
+    let total: u16 = chips.iter().map(|(_, text)| text.width() as u16).sum();
+    let room = area.width.saturating_sub(total) as usize;
+
+    let mut spans = vec![Span::styled(TITLE, theme::heading())];
+    if TITLE.width() + TAGLINE.width() <= room {
+        spans.push(Span::styled(TAGLINE, theme::faint()));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::PANEL)),
+        area,
+    );
+
+    if room < TITLE.width() {
+        return;
+    }
+    let mut x = area.right() - total;
+    for (hit, text) in chips {
+        let rect = Rect::new(x, area.y, text.width() as u16, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(chip_span(
+                text,
+                hovered(hover, rect),
+                theme::PANEL,
+            ))),
+            rect,
+        );
+        hits.push((rect, hit));
+        x += rect.width;
+    }
+}
+
+/// A quiet clickable label on the chrome: readable, but not a filled button.
 ///
-/// A fixed list would have to be either too long to read or too short to help;
-/// showing what is live right now is what makes ticking and toggling findable
-/// without opening the help.
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let apply_style = if app.can_apply() {
-        theme::key()
+/// It takes the background it is painted on, because the header bar and a panel
+/// border are different colours and a chip that carries the wrong one shows as
+/// a patch along the edge.
+fn chip_span(text: &str, hovered: bool, background: Color) -> Span<'static> {
+    let style = if hovered {
+        Style::default()
+            .fg(theme::FOREGROUND)
+            .bg(theme::SELECTION_BACKGROUND)
     } else {
-        theme::faint()
+        theme::faint().bg(background)
     };
+    Span::styled(text.to_string(), style)
+}
+
+/// Current status followed by the keys the focused control answers to.
+///
+/// Only keys that are *not* already printed on something visible earn a place
+/// here. Every verb has a button with its key on the label, and ticking every
+/// row or none of them sits on the results border, so repeating any of that
+/// would just be a second copy of the screen along the bottom edge.
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let mut hints: Vec<(&str, &str, Style)> = match app.focus {
         Focus::Directory => vec![
             ("enter", "preview", theme::key()),
-            ("o", "browse", theme::key()),
             ("↓", "next field", theme::key()),
             ("esc", "leave field", theme::key()),
         ],
@@ -102,34 +154,64 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("space", "toggle", theme::key()),
             ("←→", "set", theme::key()),
             ("↑↓", "move", theme::key()),
-            ("p", "preview", theme::key()),
         ],
         Focus::Level => vec![
             ("↑↓", "choose", theme::key()),
             ("space", "cycle", theme::key()),
-            ("p", "preview", theme::key()),
         ],
         Focus::Results => vec![
             ("space", "tick", theme::key()),
-            ("a", "apply", apply_style),
-            ("p", "preview", theme::key()),
             ("←→", "tabs", theme::key()),
-            ("^a", "all", theme::key()),
-            ("^r", "none", theme::key()),
-            ("d", "demo", theme::key()),
         ],
     };
-    hints.push(("?", "help", theme::key()));
-    hints.push(("q", "quit", theme::key()));
+    for (hit, key, label) in [
+        (Hit::PreviewButton, "p", "preview"),
+        (Hit::ApplyButton, "a", "apply"),
+        (Hit::DemoButton, "d", "demo"),
+    ] {
+        if !app.hits.iter().any(|(_, visible)| *visible == hit) {
+            hints.push((key, label, theme::key()));
+        }
+    }
 
-    // Help and quit are the two that survive a narrow terminal; the rest drop
-    // off the end until the line fits.
-    const ALWAYS_KEPT: usize = 2;
-    while hints.len() > ALWAYS_KEPT && hints_width(&hints) > area.width as usize {
-        hints.remove(hints.len() - ALWAYS_KEPT - 1);
+    // Below this width the header cannot fit its Help and Quit controls. That
+    // size is unsupported, but keep the two escape hatches visible anyway.
+    let cramped = area.width < 38;
+    if cramped {
+        hints = vec![("?", "help", theme::key()), ("q", "quit", theme::key())];
+    }
+
+    let status_width = 1 + app.status.text.width() + usize::from(app.busy()) * 2;
+    while !cramped
+        && !hints.is_empty()
+        && status_width + 3 + hints_width(&hints).saturating_sub(1) > area.width as usize
+    {
+        hints.pop();
     }
 
     let mut spans = vec![Span::raw(" ")];
+    if !cramped {
+        let colour = match app.status.kind {
+            StatusKind::Ready => theme::MUTED,
+            StatusKind::Working => theme::WORKING,
+            StatusKind::Success => theme::SUCCESS,
+            StatusKind::Demo => theme::DEMO,
+            StatusKind::Error => theme::ERROR,
+        };
+        if app.busy() {
+            spans.push(Span::styled(
+                format!("{} ", SPINNER[app.ticks % SPINNER.len()]),
+                Style::default().fg(colour),
+            ));
+        }
+        spans.push(Span::styled(
+            app.status.text.clone(),
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ));
+        if !hints.is_empty() {
+            spans.push(Span::styled(" · ", theme::faint()));
+        }
+    }
     for (index, (key, label, style)) in hints.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(" · ", theme::faint()));
@@ -155,6 +237,7 @@ fn hints_width(hints: &[(&str, &str, Style)]) -> usize {
 // ------------------------------------------------------------- setup column
 
 fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.setup_area = area;
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::border(false))
@@ -182,7 +265,13 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
         app.focus == Focus::Directory,
     ));
     let input_row = rows.len() - 1;
-    rows.push(SetupRow::text(hint_line("o  browse for a folder")));
+    rows.push(SetupRow::button(
+        "o",
+        "Browse for a folder",
+        ButtonKind::Neutral,
+        width,
+    ));
+    let browse_button_row = rows.len() - 1;
     rows.push(SetupRow::blank());
 
     rows.push(SetupRow::text(label_line("Options", false, "", width)));
@@ -229,7 +318,11 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     rows.push(SetupRow::blank());
 
+    // A blank row between the three keeps them reading as separate buttons
+    // rather than one striped block.
     rows.push(SetupRow::button("p", "Preview", ButtonKind::Primary, width));
+    let preview_button_row = rows.len() - 1;
+    rows.push(SetupRow::blank());
     rows.push(SetupRow::button(
         "a",
         "Apply renames",
@@ -240,34 +333,85 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         width,
     ));
+    let apply_button_row = rows.len() - 1;
+    rows.push(SetupRow::blank());
     rows.push(SetupRow::button(
         "d",
         "Demo mode",
         ButtonKind::Neutral,
         width,
     ));
+    let demo_button_row = rows.len() - 1;
 
-    // Scroll just enough to keep whatever holds the keyboard on screen.
-    let focus_row = match app.focus {
-        Focus::Directory => input_row,
-        Focus::Recursive => recursive_row,
-        Focus::Strict => strict_row,
-        Focus::Level => level_rows[app.level.index()],
-        Focus::Results => 0,
-    };
+    // Taking the keyboard drags the column to whatever now holds it; between
+    // those moves the wheel is free to put it anywhere, which is the only way a
+    // pointer can reach the buttons in a short terminal.
     let height = inner.height as usize;
-    let scroll = if rows.len() <= height {
-        0
-    } else {
-        focus_row
-            .saturating_sub(height.saturating_sub(1))
-            .min(rows.len() - height)
-    };
+    if app.setup_focus != app.focus {
+        app.setup_focus = app.focus;
+        let focus_row = match app.focus {
+            Focus::Directory => input_row,
+            Focus::Recursive => recursive_row,
+            Focus::Strict => strict_row,
+            Focus::Level => level_rows[app.level.index()],
+            Focus::Results => 0,
+        };
+        app.setup_scroll = focus_row.saturating_sub(height.saturating_sub(1));
+    }
+    let scroll = app.setup_scroll.min(rows.len().saturating_sub(height));
+    app.setup_scroll = scroll;
 
-    for (offset, row) in rows.iter().enumerate().skip(scroll).take(height) {
+    for (offset, row) in rows.iter_mut().enumerate().skip(scroll).take(height) {
         let y = inner.y + (offset - scroll) as u16;
-        let line_area = Rect::new(inner.x, y, inner.width, 1);
-        frame.render_widget(Paragraph::new(row.line.clone()).style(row.style), line_area);
+        let line_area = Rect::new(
+            inner.x + row.inset,
+            y,
+            inner.width.saturating_sub(2 * row.inset),
+            1,
+        );
+        // Every control row answers a click; hint and heading rows do not.
+        let hit = if offset == input_row {
+            Some(Hit::Directory)
+        } else if offset == browse_button_row {
+            Some(Hit::BrowseButton)
+        } else if offset == recursive_row {
+            Some(Hit::Recursive)
+        } else if offset == strict_row {
+            Some(Hit::Strict)
+        } else if let Some(level) = level_rows.iter().position(|row| *row == offset) {
+            Some(Hit::Level(level))
+        } else if offset == preview_button_row {
+            Some(Hit::PreviewButton)
+        } else if offset == apply_button_row {
+            Some(Hit::ApplyButton)
+        } else if offset == demo_button_row {
+            Some(Hit::DemoButton)
+        } else {
+            None
+        };
+        let mut style = row.style;
+        if let Some(hit) = hit {
+            app.hits.push((line_area, hit));
+            let under = hovered(app.hover, line_area);
+            if row.inset > 0 {
+                // A button carries its fill in the spans, so hovering lifts
+                // every filled span one step up the same ramp; the row style
+                // behind it is the panel, which must not move.
+                if under {
+                    for span in &mut row.line.spans {
+                        span.style.bg = span.style.bg.map(theme::hovered_fill);
+                    }
+                }
+            } else if under {
+                // The flat controls take the selection background under the
+                // pointer, which is what says "a click here would land".
+                style = style.bg(theme::SELECTION_BACKGROUND);
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(row.line.clone()).style(style),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
         if offset == input_row && app.focus == Focus::Directory {
             let column = inner.x + 2 + cursor as u16;
             frame.set_cursor_position((column.min(inner.right().saturating_sub(1)), y));
@@ -279,8 +423,11 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
 struct SetupRow {
     line: Line<'static>,
     style: Style,
+    /// Columns the clickable area is held in from either edge of the column.
+    inset: u16,
 }
 
+#[derive(Clone, Copy)]
 enum ButtonKind {
     Primary,
     Confirm,
@@ -288,11 +435,50 @@ enum ButtonKind {
     Disabled,
 }
 
+impl ButtonKind {
+    /// Fill and text colour, in that order.
+    fn colours(self) -> (Color, Color) {
+        match self {
+            Self::Primary => (theme::FOCUS, theme::PANEL),
+            Self::Confirm => (theme::SUCCESS, theme::PANEL),
+            Self::Neutral => (theme::SELECTION_BACKGROUND, theme::FOREGROUND),
+            Self::Disabled => (theme::SELECTION_BACKGROUND, theme::FAINT),
+        }
+    }
+}
+
+/// A button reads `Label (k)`: what it does first, the key that does it after.
+///
+/// The two are separate spans so the key can sit back a shade without breaking
+/// the fill, and the whole thing is padded to a fixed shape by its caller.
+fn button_spans(label: &str, key: &str, kind: ButtonKind, hovered: bool) -> [Span<'static>; 2] {
+    let (fill, foreground) = kind.colours();
+    let fill = if hovered {
+        theme::hovered_fill(fill)
+    } else {
+        fill
+    };
+    let base = Style::default().fg(foreground).bg(fill);
+    [
+        Span::styled(label.to_string(), base.add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" ({key})"), base),
+    ]
+}
+
+/// Columns [`button_spans`] takes, plus the padding a free-standing button gets.
+fn button_width(label: &str, key: &str) -> usize {
+    label.width() + key.width() + 3 + 2 * BUTTON_PADDING
+}
+
+/// Blank columns held either side of a button's text.
+const BUTTON_PADDING: usize = 2;
+
 impl SetupRow {
     fn text(line: Line<'static>) -> Self {
         Self {
             line,
             style: Style::default().bg(theme::SURFACE),
+            inset: 0,
         }
     }
 
@@ -316,6 +502,7 @@ impl SetupRow {
             } else {
                 theme::PANEL
             }),
+            inset: 0,
         }
     }
 
@@ -370,37 +557,39 @@ impl SetupRow {
             } else {
                 theme::SURFACE
             }),
+            inset: 0,
         }
     }
 
+    /// A full-width button, held off the panel edges so it reads as a control
+    /// sitting on the column rather than a band painted across it.
     fn button(key: &str, label: &str, kind: ButtonKind, width: usize) -> Self {
-        let (background, foreground) = match kind {
-            ButtonKind::Primary => (theme::FOCUS, theme::PANEL),
-            ButtonKind::Confirm => (theme::SUCCESS, theme::PANEL),
-            ButtonKind::Neutral => (theme::SELECTION_BACKGROUND, theme::FOREGROUND),
-            ButtonKind::Disabled => (theme::SELECTION_BACKGROUND, theme::FAINT),
+        let fill = kind.colours().0;
+        let inner = width.saturating_sub(2 * BUTTON_MARGIN);
+        let text = label.width() + key.width() + 3;
+        let left = inner.saturating_sub(text) / 2;
+        let margin = || {
+            Span::styled(
+                " ".repeat(BUTTON_MARGIN),
+                Style::default().bg(theme::SURFACE),
+            )
         };
-        let text = format!("{key}  {label}");
-        let inner_width = width.saturating_sub(2);
-        let left = inner_width.saturating_sub(text.width()) / 2;
-        let content = format!(
-            " {}{}{} ",
-            " ".repeat(left),
-            text,
-            " ".repeat(inner_width.saturating_sub(left + text.width()))
-        );
+        let pad = |columns: usize| Span::styled(" ".repeat(columns), Style::default().bg(fill));
+
+        let mut spans = vec![margin(), pad(left)];
+        spans.extend(button_spans(label, key, kind, false));
+        spans.push(pad(inner.saturating_sub(left + text)));
+        spans.push(margin());
         Self {
-            line: Line::from(Span::styled(
-                content,
-                Style::default()
-                    .fg(foreground)
-                    .bg(background)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            line: Line::from(spans),
             style: Style::default().bg(theme::SURFACE),
+            inset: BUTTON_MARGIN as u16,
         }
     }
 }
+
+/// Columns of panel left bare either side of a full-width button.
+const BUTTON_MARGIN: usize = 1;
 
 /// The mark in front of whatever holds the keyboard, in every list on screen.
 const CARET: &str = "▸ ";
@@ -445,29 +634,54 @@ fn hint_line(text: &str) -> Line<'static> {
 // ------------------------------------------------------------ results column
 
 fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
-    let [summary_area, list_area, detail_area, status_area] = Layout::vertical([
+    let [summary_area, list_area, detail_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
 
     draw_summary(frame, app, summary_area);
 
+    // The tab chips sit on the top border; measure them off the same strings
+    // the title draws, so a click lands exactly on what is painted.
+    let (matched, skipped) = tab_counts(app);
+    let (matched_chip, skipped_chip) = (chip("To rename", matched), chip("Skipped", skipped));
+    let mut x = list_area.x + 1;
+    let matched_strip = Rect::new(x, list_area.y, matched_chip.width() as u16, 1);
+    x += matched_strip.width + 1;
+    let skipped_strip = Rect::new(x, list_area.y, skipped_chip.width() as u16, 1);
+    app.hits.push((matched_strip, Hit::Tab(Tab::Matched)));
+    app.hits.push((skipped_strip, Hit::Tab(Tab::Skipped)));
+
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::border(app.focus == Focus::Results))
         .style(Style::default().bg(theme::SURFACE))
-        .title_top(tab_line(app))
+        .title_top(tab_line(
+            app,
+            hovered(app.hover, matched_strip),
+            hovered(app.hover, skipped_strip),
+        ))
         .padding(Padding::horizontal(1));
-    // The keys that tick, printed on the box they act on. The footer says the
-    // same thing, but this is where the eye already is.
-    if app.tab == Tab::Matched && app.preview.as_ref().is_some_and(|p| !p.prepared.is_empty()) {
-        block = block.title_bottom(Span::styled(
-            " space  tick · ^a  all · ^r  none ",
-            theme::faint(),
-        ));
+    // Ticking every row or none of them is a chord, so it gets clickable chips
+    // on the box it acts on. The footer no longer repeats them.
+    if app.tab == Tab::Matched
+        && list_area.height >= 3
+        && app.preview.as_ref().is_some_and(|p| !p.prepared.is_empty())
+    {
+        const ALL: &str = " Tick all (^a) ";
+        const NONE: &str = " Tick none (^r) ";
+        let y = list_area.bottom() - 1;
+        let all_strip = Rect::new(list_area.x + 1, y, ALL.width() as u16, 1);
+        let none_strip = Rect::new(all_strip.right() + 1, y, NONE.width() as u16, 1);
+        block = block.title_bottom(Line::from(vec![
+            chip_span(ALL, hovered(app.hover, all_strip), theme::SURFACE),
+            Span::raw(" "),
+            chip_span(NONE, hovered(app.hover, none_strip), theme::SURFACE),
+        ]));
+        app.hits.push((all_strip, Hit::TickAll));
+        app.hits.push((none_strip, Hit::TickNone));
     }
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
@@ -477,34 +691,48 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Skipped => draw_skipped(frame, app, inner),
     }
     draw_detail(frame, app, detail_area);
-    draw_status(frame, app, status_area);
 }
 
-fn tab_line(app: &App) -> Line<'static> {
-    let (matched, skipped) = app.preview.as_ref().map_or((0, 0), |preview| {
+fn tab_counts(app: &App) -> (usize, usize) {
+    app.preview.as_ref().map_or((0, 0), |preview| {
         (preview.prepared.len(), preview.plan.skipped.len())
-    });
+    })
+}
+
+/// The painted text of a tab chip, shared by the title and its click strip.
+fn chip(label: &str, count: usize) -> String {
+    format!(" {label} ({count}) ")
+}
+
+fn tab_line(app: &App, matched_hover: bool, skipped_hover: bool) -> Line<'static> {
+    let (matched, skipped) = tab_counts(app);
     // The open tab is a filled chip rather than just bold text, so which of the
-    // two lists is on screen reads at a glance.
-    let style = |active: bool| {
+    // two lists is on screen reads at a glance. Under the pointer an inactive
+    // chip takes the same fill without the bold: clickable, but not where the
+    // keyboard is.
+    let style = |active: bool, under_pointer: bool| {
         if active {
             Style::default()
                 .fg(theme::FOREGROUND)
                 .bg(theme::SELECTION_BACKGROUND)
                 .add_modifier(Modifier::BOLD)
+        } else if under_pointer {
+            Style::default()
+                .fg(theme::FOREGROUND)
+                .bg(theme::SELECTION_BACKGROUND)
         } else {
             theme::faint()
         }
     };
     let mut spans = vec![
         Span::styled(
-            format!(" To rename ({matched}) "),
-            style(app.tab == Tab::Matched),
+            chip("To rename", matched),
+            style(app.tab == Tab::Matched, matched_hover),
         ),
         Span::raw(" "),
         Span::styled(
-            format!(" Skipped ({skipped}) "),
-            style(app.tab == Tab::Skipped),
+            chip("Skipped", skipped),
+            style(app.tab == Tab::Skipped, skipped_hover),
         ),
     ];
     if app.focus == Focus::Results {
@@ -572,12 +800,34 @@ fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // The caret takes a column from every row, highlighted or not.
     let width = (area.width as usize).saturating_sub(CARET.width());
+    // Hover tinting needs each visible row's rectangle before the list is
+    // rendered, so it works off the offset of the previous frame; a frame that
+    // scrolls redraws immediately anyway.
+    let count = preview.prepared.len();
+    let assumed_offset = preview.matched_state.offset().min(count.saturating_sub(1));
+    let rows_on_screen = area.height as usize;
     let items: Vec<ListItem> = preview
         .prepared
         .iter()
         .zip(&preview.ticked)
-        .map(|(prepared, ticked)| {
-            ListItem::new(operation_line(prepared, *ticked, &preview.plan, width))
+        .enumerate()
+        .map(|(index, (prepared, ticked))| {
+            let mut item = ListItem::new(operation_line(prepared, *ticked, &preview.plan, width));
+            if index >= assumed_offset
+                && index < assumed_offset + rows_on_screen
+                && hovered(
+                    app.hover,
+                    Rect::new(
+                        area.x,
+                        area.y + (index - assumed_offset) as u16,
+                        area.width,
+                        1,
+                    ),
+                )
+            {
+                item = item.style(Style::default().bg(theme::SELECTION_BACKGROUND));
+            }
+            item
         })
         .collect();
     let list = List::new(items).highlight_symbol(CARET).highlight_style(
@@ -586,6 +836,19 @@ fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
     frame.render_stateful_widget(list, area, &mut preview.matched_state);
+
+    // Register from the offset as rendered, so clicks land on what is shown.
+    for index in
+        preview.matched_state.offset()..count.min(preview.matched_state.offset() + rows_on_screen)
+    {
+        let row = Rect::new(
+            area.x,
+            area.y + (index - preview.matched_state.offset()) as u16,
+            area.width,
+            1,
+        );
+        app.hits.push((row, Hit::MatchedRow(index)));
+    }
 }
 
 /// `[✓] source → target        badge`, with the badge pushed to the right.
@@ -638,16 +901,37 @@ fn draw_skipped(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let root = preview.plan.root.clone();
+    // The header takes the first line, so data rows start one below; hover and
+    // click rectangles follow it.
+    let assumed_offset = preview.skipped_state.offset();
+    let count = preview.plan.skipped.len();
+    let rows_on_screen = area.height.saturating_sub(1) as usize;
     let rows: Vec<Row> = preview
         .plan
         .skipped
         .iter()
-        .map(|skipped| {
-            Row::new(vec![
+        .enumerate()
+        .map(|(index, skipped)| {
+            let mut row = Row::new(vec![
                 Cell::from(display_path(&skipped.path, &root))
                     .style(Style::default().fg(theme::FOREGROUND)),
                 Cell::from(skip_label(&skipped.reason)).style(theme::muted()),
-            ])
+            ]);
+            if index >= assumed_offset
+                && index < assumed_offset + rows_on_screen
+                && hovered(
+                    app.hover,
+                    Rect::new(
+                        area.x,
+                        area.y + 1 + (index - assumed_offset) as u16,
+                        area.width,
+                        1,
+                    ),
+                )
+            {
+                row = row.style(Style::default().bg(theme::SELECTION_BACKGROUND));
+            }
+            row
         })
         .collect();
     let table = Table::new(
@@ -658,6 +942,18 @@ fn draw_skipped(frame: &mut Frame, app: &mut App, area: Rect) {
     .highlight_symbol(CARET)
     .row_highlight_style(Style::default().bg(theme::SELECTION_BACKGROUND));
     frame.render_stateful_widget(table, area, &mut preview.skipped_state);
+
+    for index in
+        preview.skipped_state.offset()..count.min(preview.skipped_state.offset() + rows_on_screen)
+    {
+        let row = Rect::new(
+            area.x,
+            area.y + 1 + (index - preview.skipped_state.offset()) as u16,
+            area.width,
+            1,
+        );
+        app.hits.push((row, Hit::SkippedRow(index)));
+    }
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
@@ -687,28 +983,6 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let colour = match app.status.kind {
-        StatusKind::Ready => theme::MUTED,
-        StatusKind::Working => theme::WORKING,
-        StatusKind::Success => theme::SUCCESS,
-        StatusKind::Demo => theme::DEMO,
-        StatusKind::Error => theme::ERROR,
-    };
-    let mut spans = Vec::new();
-    if app.busy() {
-        spans.push(Span::styled(
-            format!("{} ", SPINNER[app.ticks % SPINNER.len()]),
-            Style::default().fg(colour),
-        ));
-    }
-    spans.push(Span::styled(
-        app.status.text.clone(),
-        Style::default().fg(colour).add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
 fn placeholder(text: &str) -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(text.to_string(), theme::faint())))
         .alignment(Alignment::Center)
@@ -716,8 +990,11 @@ fn placeholder(text: &str) -> Paragraph<'static> {
 
 // ------------------------------------------------------------------- modals
 
+/// Every dialog is the same width, so they never jump around between steps.
+const DIALOG_WIDTH: u16 = 72;
+
 /// Every key, grouped by what it is for, with the vim spelling beside the arrows.
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, hover: Option<Position>, hits: &mut Vec<(Rect, Hit)>) {
     let shortcuts: [(&str, &str); 15] = [
         ("tab / shift+tab", "Next / previous control"),
         ("↑ ↓  or  k j", "Move in a control, and between them"),
@@ -757,17 +1034,26 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         theme::faint(),
     )));
 
-    let popup = centered(area, 72, lines.len() as u16 + 4);
+    let popup = centered(area, DIALOG_WIDTH, lines.len() as u16 + 4);
     render_dialog(
         frame,
         popup,
         " Keyboard shortcuts ",
         Text::from(lines),
-        " esc  close ",
+        &[(Hit::HelpClose, "Close", "esc", ButtonKind::Neutral)],
+        hover,
+        hits,
     );
 }
 
-fn draw_confirm(frame: &mut Frame, area: Rect, count: usize, examples: &[String]) {
+fn draw_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    count: usize,
+    examples: &[String],
+    hover: Option<Position>,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
     let mut lines = vec![
         Line::from(Span::styled(
             format!(
@@ -782,10 +1068,13 @@ fn draw_confirm(frame: &mut Frame, area: Rect, count: usize, examples: &[String]
         )),
         Line::default(),
     ];
+    // Wrapped here rather than by the paragraph, so the dialog is sized for the
+    // rows it actually needs and a long rename is never cut off at the bottom.
     lines.extend(
         examples
             .iter()
-            .map(|example| Line::from(Span::styled(example.clone(), theme::muted()))),
+            .flat_map(|example| wrap(example, DIALOG_WIDTH as usize - 2))
+            .map(|line| Line::from(Span::styled(line, theme::muted()))),
     );
     if count > examples.len() {
         lines.push(Line::from(Span::styled(
@@ -794,18 +1083,29 @@ fn draw_confirm(frame: &mut Frame, area: Rect, count: usize, examples: &[String]
         )));
     }
 
-    let popup = centered(area, 72, lines.len() as u16 + 4);
+    let popup = centered(area, DIALOG_WIDTH, lines.len() as u16 + 4);
     render_dialog(
         frame,
         popup,
         " Confirm apply ",
         Text::from(lines),
-        " enter  apply   esc  cancel ",
+        &[
+            (Hit::ConfirmCancel, "Cancel", "esc", ButtonKind::Neutral),
+            (Hit::ConfirmApply, "Apply", "enter", ButtonKind::Confirm),
+        ],
+        hover,
+        hits,
     );
 }
 
-fn draw_picker(frame: &mut Frame, area: Rect, picker: &mut crate::tui::picker::Picker) {
-    let popup = centered(area, 72, 22);
+fn draw_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &mut crate::tui::picker::Picker,
+    hover: Option<Position>,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let popup = centered(area, DIALOG_WIDTH, 22);
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -813,15 +1113,20 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &mut crate::tui::picker::P
         .style(Style::default().bg(theme::PANEL))
         .title_top(Span::styled(" Choose a directory ", theme::heading()))
         .title_bottom(Span::styled(
-            " ↑↓/jk  move   enter/l  open   ←/h  up   s  use folder   esc  cancel ",
+            " ↑↓/jk  move   enter/l  open ",
             theme::faint(),
         ))
         .padding(Padding::horizontal(1));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let [current_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+    let [current_area, list_area, _, buttons_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             picker.current.to_string_lossy().into_owned(),
@@ -829,6 +1134,31 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &mut crate::tui::picker::P
         )))
         .wrap(Wrap { trim: true }),
         current_area,
+    );
+
+    // Going up a level, taking this folder and backing out are all keys
+    // otherwise, so each one gets a button; the buttons are drawn before the
+    // listing can bail out, because an unreadable folder is exactly when a way
+    // back up matters most.
+    draw_dialog_buttons(
+        frame,
+        buttons_area,
+        &[
+            (
+                Hit::PickerParent,
+                "Parent folder",
+                "h",
+                if picker.current.parent().is_some() {
+                    ButtonKind::Neutral
+                } else {
+                    ButtonKind::Disabled
+                },
+            ),
+            (Hit::PickerCancel, "Cancel", "esc", ButtonKind::Neutral),
+            (Hit::PickerUse, "Use this folder", "s", ButtonKind::Primary),
+        ],
+        hover,
+        hits,
     );
 
     if let Some(error) = picker.error.clone() {
@@ -839,18 +1169,37 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &mut crate::tui::picker::P
         frame.render_widget(placeholder("No subfolders here"), list_area);
         return;
     }
+    let count = picker.entries.len();
+    let assumed_offset = picker.state.offset();
+    let rows_on_screen = list_area.height as usize;
     let items: Vec<ListItem> = picker
         .entries
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(index, entry)| {
             let name = entry
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            ListItem::new(Line::from(vec![
+            let mut item = ListItem::new(Line::from(vec![
                 Span::styled("📁 ", theme::faint()),
                 Span::styled(name, Style::default().fg(theme::FOREGROUND)),
-            ]))
+            ]));
+            if index >= assumed_offset
+                && index < assumed_offset + rows_on_screen
+                && hovered(
+                    hover,
+                    Rect::new(
+                        list_area.x,
+                        list_area.y + (index - assumed_offset) as u16,
+                        list_area.width,
+                        1,
+                    ),
+                )
+            {
+                item = item.style(Style::default().bg(theme::SELECTION_BACKGROUND));
+            }
+            item
         })
         .collect();
     let list = List::new(items).highlight_style(
@@ -859,20 +1208,102 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &mut crate::tui::picker::P
             .add_modifier(Modifier::BOLD),
     );
     frame.render_stateful_widget(list, list_area, &mut picker.state);
+
+    for index in picker.state.offset()..count.min(picker.state.offset() + rows_on_screen) {
+        let row = Rect::new(
+            list_area.x,
+            list_area.y + (index - picker.state.offset()) as u16,
+            list_area.width,
+            1,
+        );
+        hits.push((row, Hit::PickerRow(index)));
+    }
 }
 
-fn render_dialog(frame: &mut Frame, area: Rect, title: &str, body: Text<'static>, footer: &str) {
+fn render_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: Text<'static>,
+    buttons: &[DialogButton],
+    hover: Option<Position>,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::FOCUS))
         .style(Style::default().bg(theme::PANEL))
         .title_top(Span::styled(title.to_string(), theme::heading()))
-        .title_bottom(Span::styled(footer.to_string(), theme::faint()))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    // The buttons sit inside the dialog with a blank row above them, so they
+    // read as things to press rather than as a caption on the border.
+    let [body_area, _, buttons_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), body_area);
+    draw_dialog_buttons(frame, buttons_area, buttons, hover, hits);
+}
+
+/// What it does, the key that does it, and how loudly it is painted.
+type DialogButton = (Hit, &'static str, &'static str, ButtonKind);
+
+/// A right-aligned row of buttons along the bottom of a dialog.
+fn draw_dialog_buttons(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: &[DialogButton],
+    hover: Option<Position>,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    const GAP: u16 = 2;
+    if area.height == 0 {
+        return;
+    }
+    // Too narrow for the whole row, so the leftmost buttons give way one at a
+    // time. Dropping the lot would strand a mouse-only user inside the dialog
+    // with no way out, so the last one — the primary action — always stays and
+    // the keys of the dropped ones still work.
+    let mut buttons = buttons;
+    let width_of = |row: &[DialogButton]| -> u16 {
+        row.iter()
+            .map(|(_, label, key, _)| button_width(label, key) as u16)
+            .sum::<u16>()
+            + GAP * row.len().saturating_sub(1) as u16
+    };
+    while buttons.len() > 1 && width_of(buttons) > area.width {
+        buttons = &buttons[1..];
+    }
+    let total = width_of(buttons);
+    if total > area.width {
+        return;
+    }
+    let widths: Vec<u16> = buttons
+        .iter()
+        .map(|(_, label, key, _)| button_width(label, key) as u16)
+        .collect();
+    let mut x = area.right() - total;
+    for ((hit, label, key, kind), width) in buttons.iter().zip(widths) {
+        let rect = Rect::new(x, area.y, width, 1);
+        let under = hovered(hover, rect);
+        let fill = if under {
+            theme::hovered_fill(kind.colours().0)
+        } else {
+            kind.colours().0
+        };
+        let pad = Span::styled(" ".repeat(BUTTON_PADDING), Style::default().bg(fill));
+        let mut spans = vec![pad.clone()];
+        spans.extend(button_spans(label, key, *kind, under));
+        spans.push(pad);
+        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        hits.push((rect, *hit));
+        x += width + GAP;
+    }
 }
 
 /// A popup of at most `width` × `height`, centred and never bigger than `area`.

@@ -6,11 +6,11 @@ mod picker;
 mod theme;
 pub mod ui;
 
-use std::io;
+use std::io::{self, stdout};
 use std::path::Path;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 
 use app::App;
 
@@ -21,11 +21,17 @@ use app::App;
 const TICK: Duration = Duration::from_millis(120);
 
 /// Run the interface until the user quits, restoring the terminal on the way out.
+///
+/// Mouse capture is always on: hovering and clicking are part of the interface.
+/// Copying text stays with the terminal's own shift-drag, as is conventional
+/// while a program owns the pointer events.
 pub fn run(directory: Option<&Path>) -> io::Result<()> {
     let mut terminal = ratatui::try_init()?;
-    let result = event_loop(&mut terminal, directory);
+    let outcome = ratatui::crossterm::execute!(stdout(), EnableMouseCapture)
+        .and_then(|()| event_loop(&mut terminal, directory));
+    let _ = ratatui::crossterm::execute!(stdout(), DisableMouseCapture);
     ratatui::try_restore()?;
-    result
+    outcome
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, directory: Option<&Path>) -> io::Result<()> {
@@ -44,6 +50,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, directory: Option<&Path>)
         }
         match event::read()? {
             Event::Key(key) => app.handle_key(key),
+            Event::Mouse(mouse) => app.handle_mouse(mouse),
             // A resize redraws on the next pass, which is the whole response.
             Event::Resize(_, _) => {}
             _ => {}

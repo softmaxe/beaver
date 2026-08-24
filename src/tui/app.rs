@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
 
 use crate::applying::{
@@ -29,6 +32,9 @@ const CONFIRM_EXAMPLE_LIMIT: usize = 5;
 /// Rows a page key moves through a list, and half of it for `ctrl+d` / `ctrl+u`.
 const PAGE: isize = 10;
 const HALF_PAGE: isize = 5;
+
+/// Rows one notch of the mouse wheel moves.
+const WHEEL: isize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -62,6 +68,38 @@ impl Focus {
 pub enum Tab {
     Matched,
     Skipped,
+}
+
+/// What a left click can land on, registered by the draw pass as rectangles.
+///
+/// The draw pass knows where everything sits, so it records each clickable
+/// region as it renders; the mouse handler then looks the position up instead
+/// of recomputing layout. Rows carry their index, so one variant per kind of
+/// target is all the dispatch needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    Directory,
+    BrowseButton,
+    Recursive,
+    Strict,
+    Level(usize),
+    PreviewButton,
+    ApplyButton,
+    DemoButton,
+    HelpButton,
+    QuitButton,
+    TickAll,
+    TickNone,
+    Tab(Tab),
+    MatchedRow(usize),
+    SkippedRow(usize),
+    PickerRow(usize),
+    PickerParent,
+    PickerUse,
+    PickerCancel,
+    ConfirmApply,
+    ConfirmCancel,
+    HelpClose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +207,20 @@ pub struct App {
     generation: u64,
     sender: Sender<Update>,
     receiver: Receiver<Update>,
+    /// Clickable regions of the frame just drawn, modal entries last.
+    pub hits: Vec<(Rect, Hit)>,
+    /// The setup column as last drawn, and how far the wheel has scrolled it.
+    ///
+    /// A short terminal cannot show the whole column, and the keyboard scrolls
+    /// it by moving the focus — which a pointer has no way to do. Without this
+    /// the action buttons are simply off the bottom for a mouse-only user.
+    pub setup_area: Rect,
+    pub setup_scroll: usize,
+    /// The focus the setup column was last drawn for, so a focus change can
+    /// drag the view back without the wheel being overruled every frame.
+    pub setup_focus: Focus,
+    /// Where the pointer is, so the draw pass can tint what it is over.
+    pub hover: Option<Position>,
 }
 
 impl Default for App {
@@ -200,6 +252,11 @@ impl App {
             generation: 0,
             sender,
             receiver,
+            hits: Vec::new(),
+            setup_area: Rect::ZERO,
+            setup_scroll: 0,
+            setup_focus: Focus::Directory,
+            hover: None,
         }
     }
 
@@ -268,10 +325,7 @@ impl App {
         } else if subtitles == 0 {
             Status::new("No subtitle files in this directory", StatusKind::Error)
         } else {
-            Status::new(
-                "Preview ready — tick items, then press a to apply",
-                StatusKind::Success,
-            )
+            Status::new("Preview ready", StatusKind::Success)
         };
         // Move off the path field so the single-letter shortcuts work at once.
         if self
@@ -747,6 +801,165 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------------- mouse
+
+    /// Movement refreshes the hover point; a left click acts where it lands.
+    ///
+    /// Capture is always on, so these arrive everywhere including over blank
+    /// areas — they simply find no registered rectangle and do nothing.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => self.hover = Some(position),
+            MouseEventKind::Down(MouseButton::Left) => self.click(position),
+            MouseEventKind::ScrollUp => self.scroll(-WHEEL, position),
+            MouseEventKind::ScrollDown => self.scroll(WHEEL, position),
+            _ => {}
+        }
+    }
+
+    /// The wheel moves whatever is under it: the picker, the setup column, or
+    /// the results.
+    fn scroll(&mut self, delta: isize, at: Position) {
+        match self.modal.as_mut() {
+            Some(Modal::Picker(picker)) => picker.move_by(delta),
+            Some(_) => {}
+            None if self.setup_area.contains(at) => {
+                self.setup_scroll = self.setup_scroll.saturating_add_signed(delta);
+            }
+            None => self.move_in_results(delta),
+        }
+    }
+
+    fn click(&mut self, position: Position) {
+        self.hover = Some(position);
+        // Later registrations sit on top, so a modal covers what is beneath it.
+        let Some(hit) = self
+            .hits
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(position))
+            .map(|(_, hit)| *hit)
+        else {
+            return;
+        };
+        match &self.modal {
+            Some(_) => self.click_in_modal(hit),
+            None => self.click_main(hit),
+        }
+    }
+
+    /// Inside a modal only its own controls answer; clicks never fall through.
+    fn click_in_modal(&mut self, hit: Hit) {
+        match (&mut self.modal, hit) {
+            (Some(Modal::Picker(picker)), Hit::PickerRow(index)) => {
+                if index < picker.entries.len() {
+                    if picker.state.selected() == Some(index) {
+                        picker.enter();
+                    } else {
+                        picker.state.select(Some(index));
+                    }
+                }
+            }
+            (Some(Modal::Picker(picker)), Hit::PickerParent) => picker.leave(),
+            (Some(Modal::Picker(_)), Hit::PickerUse) => self.use_picker_folder(),
+            (Some(Modal::Picker(_)), Hit::PickerCancel) | (Some(Modal::Help), Hit::HelpClose) => {
+                self.modal = None;
+            }
+            (Some(Modal::Confirm { .. }), Hit::ConfirmApply) => {
+                self.modal = None;
+                self.start_apply();
+            }
+            (Some(Modal::Confirm { .. }), Hit::ConfirmCancel) => self.modal = None,
+            _ => {}
+        }
+    }
+
+    /// Take the folder the picker is showing as the directory to scan.
+    fn use_picker_folder(&mut self) {
+        let Some(Modal::Picker(picker)) = &self.modal else {
+            return;
+        };
+        let chosen = picker.current.clone();
+        self.modal = None;
+        self.directory.set_value(&chosen.to_string_lossy());
+        self.invalidate_preview();
+        self.focus = Focus::Directory;
+    }
+
+    fn click_main(&mut self, hit: Hit) {
+        match hit {
+            Hit::Directory => self.focus = Focus::Directory,
+            Hit::BrowseButton => self.action_browse(),
+            Hit::Recursive => {
+                self.focus = Focus::Recursive;
+                self.recursive = !self.recursive;
+                self.invalidate_preview();
+            }
+            Hit::Strict => {
+                self.focus = Focus::Strict;
+                self.strict = !self.strict;
+                self.invalidate_preview();
+            }
+            Hit::Level(index) => {
+                self.focus = Focus::Level;
+                self.set_level(MatchLevel::from_index(index));
+            }
+            Hit::PreviewButton => self.action_preview(),
+            Hit::ApplyButton => self.action_apply(),
+            Hit::DemoButton => self.action_demo(),
+            Hit::HelpButton => self.modal = Some(Modal::Help),
+            Hit::QuitButton => self.request_quit(),
+            Hit::TickAll => self.tick_all(true),
+            Hit::TickNone => self.tick_all(false),
+            Hit::Tab(tab) => {
+                self.tab = tab;
+                self.focus = Focus::Results;
+            }
+            Hit::MatchedRow(index) => self.click_matched_row(index),
+            Hit::SkippedRow(index) => {
+                self.focus = Focus::Results;
+                self.tab = Tab::Skipped;
+                if let Some(preview) = self.preview.as_mut() {
+                    if index < preview.plan.skipped.len() {
+                        preview.skipped_state.select(Some(index));
+                    }
+                }
+            }
+            // The modals own these variants; reaching one with no modal open
+            // means the rectangle outlived the modal, so it is simply ignored.
+            Hit::PickerRow(_)
+            | Hit::PickerParent
+            | Hit::PickerUse
+            | Hit::PickerCancel
+            | Hit::ConfirmApply
+            | Hit::ConfirmCancel
+            | Hit::HelpClose => {}
+        }
+    }
+
+    /// First click selects, second click on the same row ticks — the double
+    /// click of every list widget, without timing any double click.
+    fn click_matched_row(&mut self, index: usize) {
+        let again = self.focus == Focus::Results
+            && self.tab == Tab::Matched
+            && self
+                .preview
+                .as_ref()
+                .and_then(|preview| preview.matched_state.selected())
+                == Some(index);
+        self.focus = Focus::Results;
+        self.tab = Tab::Matched;
+        if let Some(preview) = self.preview.as_mut() {
+            if index < preview.prepared.len() {
+                preview.matched_state.select(Some(index));
+            }
+        }
+        if again {
+            self.toggle_highlighted();
+        }
+    }
+
     // -------------------------------------------------------------------- modals
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
@@ -782,13 +995,7 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => picker.move_by(isize::MAX),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => picker.enter(),
                 KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => picker.leave(),
-                KeyCode::Char('s' | ' ') => {
-                    let chosen = picker.current.clone();
-                    self.modal = None;
-                    self.directory.set_value(&chosen.to_string_lossy());
-                    self.invalidate_preview();
-                    self.focus = Focus::Directory;
-                }
+                KeyCode::Char('s' | ' ') => self.use_picker_folder(),
                 KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
                 _ => {}
             },
