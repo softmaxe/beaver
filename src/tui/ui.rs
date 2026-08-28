@@ -1,16 +1,18 @@
 //! Drawing the interface.
 //!
-//! Layout is measured in character cells, not pixels. Everything the user
-//! configures lives on the left, everything the tool reports lives on the right;
-//! that split is what makes the three-step workflow legible without numbering the
-//! steps. Below 100 columns the two panes cannot sit side by side, so they stack.
+//! One step is on screen at a time. A bar of dots across the top says where the
+//! wizard is, a single card underneath holds everything that step needs, and the
+//! footer says what just happened and which keys the focused control answers to.
+//! Nothing else competes for attention: there is exactly one card, and the
+//! keyboard is always somewhere inside it.
+//!
+//! Layout is measured in character cells, not pixels. The smallest supported
+//! terminal is 80 × 24.
 
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, BorderType, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, Wrap,
-};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -18,43 +20,40 @@ use crate::applying::PreparedOperation;
 use crate::paths::display_path;
 use crate::planning::{MatchReason, RenamePlan};
 use crate::presentation::{match_badge, plural, skip_label, MatchLevel};
-use crate::tui::app::{App, Focus, Hit, Modal, StatusKind, Tab};
+use crate::tui::app::{App, Control, Hit, Modal, Outcome, StatusKind, Step};
 use crate::tui::theme;
 
-/// Narrower than this, the setup column and the results cannot share a row.
-const WIDE_LAYOUT_MINIMUM: u16 = 100;
-const SETUP_WIDTH: u16 = 38;
+/// Columns one step of the bar takes, dot and label together.
+const DOT_STRIDE: usize = 12;
+/// The widest a card ever gets, so a line of text never runs the full terminal.
+const CARD_WIDTH: u16 = 62;
+/// The preview holds a list of filenames, so it is allowed to be wider.
+const PREVIEW_WIDTH: u16 = 100;
+/// Shorter than this, the blank rows around the card go to the card.
+const AIR_MINIMUM: u16 = 26;
 const SPINNER: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+/// The mark in front of whatever holds the keyboard.
+const CARET: &str = "▸ ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits.clear();
     let area = frame.area();
     frame.render_widget(Block::new().style(theme::base()), area);
 
-    let [header_area, body_area, footer_area] = Layout::vertical([
+    let air = u16::from(area.height >= AIR_MINIMUM);
+    let [header_area, _, steps_area, _, body_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(3),
+        Constraint::Length(air),
+        Constraint::Length(2),
+        Constraint::Length(air),
+        Constraint::Min(5),
         Constraint::Length(1),
     ])
     .areas(area);
 
-    draw_header(frame, header_area, app.hover, &mut app.hits);
-    if body_area.width >= WIDE_LAYOUT_MINIMUM {
-        let [setup_area, results_area] =
-            Layout::horizontal([Constraint::Length(SETUP_WIDTH), Constraint::Min(20)])
-                .areas(body_area);
-        draw_setup(frame, app, setup_area);
-        draw_results(frame, app, results_area);
-    } else {
-        // Setup keeps at most 45% of the height and scrolls internally, so the
-        // results stay on screen even in an 80x24 terminal.
-        let setup_height = (body_area.height * 45 / 100).max(6);
-        let [setup_area, results_area] =
-            Layout::vertical([Constraint::Length(setup_height), Constraint::Min(5)])
-                .areas(body_area);
-        draw_setup(frame, app, setup_area);
-        draw_results(frame, app, results_area);
-    }
+    draw_header(frame, app, header_area);
+    draw_steps(frame, app, steps_area);
+    draw_card(frame, app, body_area.inner(Margin::new(1, 0)));
     draw_footer(frame, app, footer_area);
 
     let hover = app.hover;
@@ -64,6 +63,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_confirm(frame, area, *count, examples, hover, &mut app.hits)
         }
         Some(Modal::Picker(picker)) => draw_picker(frame, area, picker, hover, &mut app.hits),
+        Some(Modal::Skipped(_)) => draw_skipped(frame, area, app),
         None => {}
     }
 }
@@ -73,401 +73,745 @@ fn hovered(hover: Option<Position>, rect: Rect) -> bool {
     hover.is_some_and(|point| rect.contains(point))
 }
 
-/// The rectangle a scrolled list paints row `index` into, or `None` when that
-/// row sits outside the visible window.
-///
-/// `header` is how many lines the widget spends above its first data row: zero
-/// for a list, one for a table with a header.
-fn row_rect(
-    area: Rect,
-    header: u16,
-    offset: usize,
-    rows_on_screen: usize,
-    index: usize,
-) -> Option<Rect> {
-    if index < offset || index >= offset + rows_on_screen {
-        return None;
-    }
-    let y = area.y + header + (index - offset) as u16;
-    Some(Rect::new(area.x, y, area.width, 1))
-}
-
-/// Register a clickable rectangle for every row the widget just painted.
-fn register_rows(
-    hits: &mut Vec<(Rect, Hit)>,
-    area: Rect,
-    header: u16,
-    offset: usize,
-    rows_on_screen: usize,
-    count: usize,
-    hit: impl Fn(usize) -> Hit,
-) {
-    for index in offset..count.min(offset + rows_on_screen) {
-        if let Some(row) = row_rect(area, header, offset, rows_on_screen, index) {
-            hits.push((row, hit(index)));
-        }
-    }
-}
-
-/// The style a row carries when the pointer rests on it.
-fn hover_style(
-    hover: Option<Position>,
-    area: Rect,
-    header: u16,
-    offset: usize,
-    rows_on_screen: usize,
-    index: usize,
-) -> Option<Style> {
-    row_rect(area, header, offset, rows_on_screen, index)
-        .filter(|rect| hovered(hover, *rect))
-        .map(|_| Style::default().bg(theme::SELECTION_BACKGROUND))
-}
-
 // ------------------------------------------------------------------ chrome
 
-fn draw_header(
-    frame: &mut Frame,
-    area: Rect,
-    hover: Option<Position>,
-    hits: &mut Vec<(Rect, Hit)>,
-) {
-    // Help and quit are otherwise keys and nothing else, which leaves a pointer
-    // with no way to reach either of them, so they take the end of the bar and
-    // the tagline gives way rather than being written over.
-    const TITLE: &str = " Subtitle Renamer ";
-    const TAGLINE: &str = "· align subtitle filenames with the videos beside them";
-    let chips = [
-        (Hit::HelpButton, " Help (?) "),
-        (Hit::QuitButton, " Quit (q) "),
-    ];
-    let total: u16 = chips.iter().map(|(_, text)| text.width() as u16).sum();
-    let room = area.width.saturating_sub(total) as usize;
+fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
+    let bar = Style::default().bg(theme::PANEL);
+    frame.render_widget(Block::new().style(bar), area);
 
-    let mut spans = vec![Span::styled(TITLE, theme::heading())];
-    if TITLE.width() + TAGLINE.width() <= room {
-        spans.push(Span::styled(TAGLINE, theme::faint()));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::PANEL)),
-        area,
-    );
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "beaver",
+            Style::default()
+                .fg(theme::HEADING)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme::PANEL),
+        ),
+        Span::styled("  subtitles → videos", theme::faint().bg(theme::PANEL)),
+    ]);
+    frame.render_widget(Paragraph::new(title), area);
 
-    if room < TITLE.width() {
+    // Two quiet chips on the right, so help and quit are never only a key.
+    let chips: [(Hit, &str, &str); 2] = [(Hit::Help, "help", "?"), (Hit::Quit, "quit", "q")];
+    let widths: Vec<u16> = chips
+        .iter()
+        .map(|(_, label, key)| (label.width() + key.width() + 4) as u16)
+        .collect();
+    let total: u16 = widths.iter().sum::<u16>() + 1;
+    if total >= area.width {
         return;
     }
     let mut x = area.right() - total;
-    for (hit, text) in chips {
-        let rect = Rect::new(x, area.y, text.width() as u16, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(chip_span(
-                text,
-                hovered(hover, rect),
-                theme::PANEL,
-            ))),
-            rect,
-        );
-        hits.push((rect, hit));
-        x += rect.width;
-    }
-}
-
-/// A quiet clickable label on the chrome: readable, but not a filled button.
-///
-/// It takes the background it is painted on, because the header bar and a panel
-/// border are different colours and a chip that carries the wrong one shows as
-/// a patch along the edge.
-fn chip_span(text: &str, hovered: bool, background: Color) -> Span<'static> {
-    let style = if hovered {
-        Style::default()
-            .fg(theme::FOREGROUND)
-            .bg(theme::SELECTION_BACKGROUND)
-    } else {
-        theme::faint().bg(background)
-    };
-    Span::styled(text.to_string(), style)
-}
-
-/// Current status followed by the keys the focused control answers to.
-///
-/// Only keys that are *not* already printed on something visible earn a place
-/// here. Every verb has a button with its key on the label, and ticking every
-/// row or none of them sits on the results border, so repeating any of that
-/// would just be a second copy of the screen along the bottom edge.
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let mut hints: Vec<(&str, &str, Style)> = match app.focus {
-        Focus::Directory => vec![
-            ("enter", "preview", theme::key()),
-            ("↓", "next field", theme::key()),
-            ("esc", "leave field", theme::key()),
-        ],
-        Focus::Recursive | Focus::Strict => vec![
-            ("space", "toggle", theme::key()),
-            ("←→", "set", theme::key()),
-            ("↑↓", "move", theme::key()),
-        ],
-        Focus::Level => vec![
-            ("↑↓", "choose", theme::key()),
-            ("space", "cycle", theme::key()),
-        ],
-        Focus::Results => vec![
-            ("space", "tick", theme::key()),
-            ("←→", "tabs", theme::key()),
-        ],
-    };
-    for (hit, key, label) in [
-        (Hit::PreviewButton, "p", "preview"),
-        (Hit::ApplyButton, "a", "apply"),
-        (Hit::DemoButton, "d", "demo"),
-    ] {
-        if !app.hits.iter().any(|(_, visible)| *visible == hit) {
-            hints.push((key, label, theme::key()));
-        }
-    }
-
-    // Below this width the header cannot fit its Help and Quit controls. That
-    // size is unsupported, but keep the two escape hatches visible anyway.
-    let cramped = area.width < 38;
-    if cramped {
-        hints = vec![("?", "help", theme::key()), ("q", "quit", theme::key())];
-    }
-
-    let status_width = 1 + app.status.text.width() + usize::from(app.busy()) * 2;
-    while !cramped
-        && !hints.is_empty()
-        && status_width + 3 + hints_width(&hints).saturating_sub(1) > area.width as usize
-    {
-        hints.pop();
-    }
-
-    let mut spans = vec![Span::raw(" ")];
-    if !cramped {
-        let colour = match app.status.kind {
-            StatusKind::Ready => theme::MUTED,
-            StatusKind::Working => theme::WORKING,
-            StatusKind::Success => theme::SUCCESS,
-            StatusKind::Demo => theme::DEMO,
-            StatusKind::Error => theme::ERROR,
+    for ((hit, label, key), width) in chips.iter().zip(widths) {
+        let rect = Rect::new(x, area.y, width, 1);
+        let under = hovered(app.hover, rect);
+        let background = if under {
+            theme::SELECTION_BACKGROUND
+        } else {
+            theme::PANEL
         };
-        if app.busy() {
-            spans.push(Span::styled(
-                format!("{} ", SPINNER[app.ticks % SPINNER.len()]),
-                Style::default().fg(colour),
-            ));
-        }
-        spans.push(Span::styled(
-            app.status.text.clone(),
-            Style::default().fg(colour).add_modifier(Modifier::BOLD),
-        ));
-        if !hints.is_empty() {
-            spans.push(Span::styled(" · ", theme::faint()));
-        }
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {key} "),
+                Style::default()
+                    .fg(theme::KEY)
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{label} "),
+                Style::default().fg(theme::MUTED).bg(background),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), rect);
+        app.hits.push((rect, *hit));
+        x += width;
     }
-    for (index, (key, label, style)) in hints.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" · ", theme::faint()));
-        }
-        spans.push(Span::styled(key, style));
-        spans.push(Span::styled(format!(" {label}"), theme::muted()));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::PANEL)),
-        area,
-    );
 }
 
-/// Columns the footer takes: a leading space, the pairs, and " · " between them.
-fn hints_width(hints: &[(&str, &str, Style)]) -> usize {
-    let pairs: usize = hints
-        .iter()
-        .map(|(key, label, _)| key.width() + 1 + label.width())
-        .sum();
-    1 + pairs + 3 * hints.len().saturating_sub(1)
-}
-
-// ------------------------------------------------------------- setup column
-
-fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
-    app.setup_area = area;
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme::border(false))
-        .style(Style::default().bg(theme::SURFACE))
-        .title_top(Span::styled(" Setup ", theme::heading()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 {
+/// The bar of dots: where the wizard is, what it has been through, what is left.
+fn draw_steps(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.height < 2 {
         return;
     }
+    let current = app.step.index();
+    let span = (Step::ORDER.len() * DOT_STRIDE) as u16;
+    let x = area.x + area.width.saturating_sub(span) / 2;
+    let width = span.min(area.width);
 
-    let width = inner.width as usize;
-    let mut rows: Vec<SetupRow> = Vec::new();
-
-    rows.push(SetupRow::text(label_line(
-        "Directory",
-        app.focus == Focus::Directory,
-        "enter",
-        width,
-    )));
-    let (text, cursor) = app.directory.view(width.saturating_sub(3));
-    rows.push(
-        SetupRow::input(
-            &text,
-            app.directory.is_empty(),
-            app.focus == Focus::Directory,
-        )
-        .on(Hit::Directory),
-    );
-    rows.push(
-        SetupRow::button("o", "Browse for a folder", ButtonKind::Neutral, width)
-            .on(Hit::BrowseButton),
-    );
-    rows.push(SetupRow::blank());
-
-    rows.push(SetupRow::text(label_line("Options", false, "", width)));
-    rows.push(
-        SetupRow::switch(
-            app.recursive,
-            "Include subfolders",
-            app.focus == Focus::Recursive,
-            width,
-        )
-        .on(Hit::Recursive),
-    );
-    rows.push(
-        SetupRow::switch(app.strict, "Strict mode", app.focus == Focus::Strict, width)
-            .on(Hit::Strict),
-    );
-    for line in wrap(
-        "Only accept subtitles that fit VideoName+ext exactly",
-        width,
-    ) {
-        rows.push(SetupRow::text(hint_line(&line)));
-    }
-    rows.push(SetupRow::blank());
-
-    rows.push(SetupRow::text(label_line(
-        "Match level",
-        app.focus == Focus::Level,
-        "↑↓",
-        width,
-    )));
-    for (index, level) in MatchLevel::ALL.into_iter().enumerate() {
-        rows.push(
-            SetupRow::radio(
-                level == app.level,
-                level.label(),
-                app.focus == Focus::Level,
-                width,
-            )
-            .on(Hit::Level(index)),
-        );
-    }
-    for line in wrap(app.level.hint(), width) {
-        rows.push(SetupRow::text(hint_line(&line)));
-    }
-    rows.push(SetupRow::blank());
-
-    // A blank row between the three keeps them reading as separate buttons
-    // rather than one striped block.
-    rows.push(SetupRow::button("p", "Preview", ButtonKind::Primary, width).on(Hit::PreviewButton));
-    rows.push(SetupRow::blank());
-    rows.push(
-        SetupRow::button(
-            "a",
-            "Apply renames",
-            if app.can_apply() {
-                ButtonKind::Confirm
-            } else {
-                ButtonKind::Disabled
-            },
-            width,
-        )
-        .on(Hit::ApplyButton),
-    );
-    rows.push(SetupRow::blank());
-    rows.push(SetupRow::button("d", "Demo mode", ButtonKind::Neutral, width).on(Hit::DemoButton));
-
-    // Taking the keyboard drags the column to whatever now holds it; between
-    // those moves the wheel is free to put it anywhere, which is the only way a
-    // pointer can reach the buttons in a short terminal.
-    let row_of = |hit: Hit| {
-        rows.iter()
-            .position(|row| row.hit == Some(hit))
-            .unwrap_or_default()
-    };
-    let height = inner.height as usize;
-    if app.setup_focus != app.focus {
-        app.setup_focus = app.focus;
-        let focus_row = match app.focus {
-            Focus::Directory => row_of(Hit::Directory),
-            Focus::Recursive => row_of(Hit::Recursive),
-            Focus::Strict => row_of(Hit::Strict),
-            Focus::Level => row_of(Hit::Level(app.level.index())),
-            Focus::Results => 0,
+    let mut dots: Vec<Span> = Vec::new();
+    let mut labels: Vec<Span> = Vec::new();
+    for (index, step) in Step::ORDER.into_iter().enumerate() {
+        let (dot, dot_style, label_style) = match index.cmp(&current) {
+            std::cmp::Ordering::Less => (
+                "●",
+                Style::default().fg(theme::SUCCESS),
+                Style::default().fg(theme::MUTED),
+            ),
+            std::cmp::Ordering::Equal => (
+                "●",
+                Style::default().fg(theme::FOCUS),
+                Style::default()
+                    .fg(theme::FOCUS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            std::cmp::Ordering::Greater => ("○", theme::faint(), theme::faint()),
         };
-        app.setup_scroll = focus_row.saturating_sub(height.saturating_sub(1));
+        dots.push(Span::styled(dot, dot_style));
+        if index + 1 < Step::ORDER.len() {
+            let connector = if index < current {
+                Style::default().fg(theme::SUCCESS)
+            } else {
+                theme::faint()
+            };
+            dots.push(Span::styled("─".repeat(DOT_STRIDE - 1), connector));
+        }
+        labels.push(Span::styled(pad(step.label(), DOT_STRIDE), label_style));
     }
-    let scroll = app.setup_scroll.min(rows.len().saturating_sub(height));
-    app.setup_scroll = scroll;
 
-    for (offset, row) in rows.iter_mut().enumerate().skip(scroll).take(height) {
-        let y = inner.y + (offset - scroll) as u16;
-        let line_area = Rect::new(
-            inner.x + row.inset,
-            y,
-            inner.width.saturating_sub(2 * row.inset),
-            1,
-        );
-        let hit = row.hit;
-        let mut style = row.style;
-        if let Some(hit) = hit {
-            app.hits.push((line_area, hit));
-            let under = hovered(app.hover, line_area);
-            if row.inset > 0 {
-                // A button carries its fill in the spans, so hovering lifts
-                // every filled span one step up the same ramp; the row style
-                // behind it is the panel, which must not move.
-                if under {
-                    for span in &mut row.line.spans {
-                        span.style.bg = span.style.bg.map(theme::hovered_fill);
-                    }
-                }
-            } else if under {
-                // The flat controls take the selection background under the
-                // pointer, which is what says "a click here would land".
-                style = style.bg(theme::SELECTION_BACKGROUND);
-            }
+    frame.render_widget(
+        Paragraph::new(Line::from(dots)),
+        Rect::new(x, area.y, width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(labels)),
+        Rect::new(x, area.y + 1, width, 1),
+    );
+
+    // A dot walks back to a step already done. Forward has preconditions, so the
+    // card's own button owns that direction.
+    for index in 0..Step::ORDER.len() {
+        let dot_x = x + (index * DOT_STRIDE) as u16;
+        if dot_x >= area.right() {
+            break;
         }
-        frame.render_widget(
-            Paragraph::new(row.line.clone()).style(style),
-            Rect::new(inner.x, y, inner.width, 1),
+        let cell = Rect::new(
+            dot_x,
+            area.y,
+            (DOT_STRIDE as u16).min(area.right() - dot_x),
+            2,
         );
-        if hit == Some(Hit::Directory) && app.focus == Focus::Directory {
-            let column = inner.x + 2 + cursor as u16;
-            frame.set_cursor_position((column.min(inner.right().saturating_sub(1)), y));
-        }
+        app.hits.push((cell, Hit::Dot(index)));
     }
 }
 
-/// One rendered line of the setup column.
-struct SetupRow {
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let bar = Style::default().bg(theme::PANEL);
+    frame.render_widget(Block::new().style(bar), area);
+
+    let colour = match app.status.kind {
+        StatusKind::Ready => theme::MUTED,
+        StatusKind::Working => theme::WORKING,
+        StatusKind::Success => theme::SUCCESS,
+        StatusKind::Demo => theme::DEMO,
+        StatusKind::Error => theme::ERROR,
+    };
+    let mut spans = vec![Span::raw(" ")];
+    if app.busy() {
+        spans.push(Span::styled(
+            format!("{} ", SPINNER[app.ticks % SPINNER.len()]),
+            Style::default().fg(theme::WORKING).bg(theme::PANEL),
+        ));
+    }
+    spans.push(Span::styled(
+        app.status.text.clone(),
+        Style::default().fg(colour).bg(theme::PANEL),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    let hints = hints_for(app);
+    let mut right: Vec<Span> = Vec::new();
+    for (index, (key, label)) in hints.iter().enumerate() {
+        if index > 0 {
+            right.push(Span::styled(
+                " ·",
+                Style::default().fg(theme::BORDER).bg(theme::PANEL),
+            ));
+        }
+        right.push(Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(theme::KEY)
+                .bg(theme::PANEL)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right.push(Span::styled(
+            (*label).to_string(),
+            Style::default().fg(theme::FAINT).bg(theme::PANEL),
+        ));
+    }
+    let width: usize = right.iter().map(|span| span.content.width()).sum();
+    if width + 2 >= area.width as usize {
+        return;
+    }
+    let rect = Rect::new(area.right() - width as u16 - 1, area.y, width as u16 + 1, 1);
+    frame.render_widget(Paragraph::new(Line::from(right)), rect);
+}
+
+/// The keys the focused control answers to right now, and nothing else.
+fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
+    if app.busy() {
+        return vec![("esc", "back")];
+    }
+    match (app.step, app.control()) {
+        (_, Some(Control::Path)) => vec![("↵", "next"), ("o", "browse"), ("↓", "leave")],
+        (Step::Folder, _) => vec![("↹", "move"), ("␣", "press"), ("↵", "next")],
+        (Step::Rules, Some(Control::Level)) => {
+            vec![("↑↓", "level"), ("←", "back"), ("↵", "preview")]
+        }
+        (Step::Rules, _) => vec![("␣", "toggle"), ("←", "back"), ("↵", "preview")],
+        (Step::Preview, Some(Control::List)) => vec![
+            ("␣", "tick"),
+            ("^a/^r", "all/none"),
+            ("s", "skipped"),
+            ("←", "back"),
+            ("a", "apply"),
+        ],
+        (Step::Preview, _) => vec![("↹", "move"), ("←", "back"), ("a", "apply")],
+        (Step::Apply, _) => vec![("↵", "start over"), ("q", "quit")],
+    }
+}
+
+// -------------------------------------------------------------------- the card
+
+/// One rendered row of a card, and what a click on it means.
+struct Row {
     line: Line<'static>,
-    style: Style,
-    /// Columns the clickable area is held in from either edge of the column.
-    inset: u16,
-    /// The click this row answers. Hint and heading rows answer none.
+    /// A row painted as a control carries its own fill in the spans.
+    filled: bool,
     hit: Option<Hit>,
 }
 
-impl SetupRow {
-    /// Mark this row as the clickable target for `hit`.
+impl Row {
+    fn text(line: Line<'static>) -> Self {
+        Self {
+            line,
+            filled: false,
+            hit: None,
+        }
+    }
+
+    fn blank() -> Self {
+        Self::text(Line::default())
+    }
+
     fn on(mut self, hit: Hit) -> Self {
         self.hit = Some(hit);
         self
     }
+
+    /// Mark the row as carrying its own fill, so a hover lifts the spans
+    /// rather than painting a block behind them.
+    fn filled(mut self) -> Self {
+        self.filled = true;
+        self
+    }
 }
 
-#[derive(Clone, Copy)]
+fn draw_card(frame: &mut Frame, app: &mut App, area: Rect) {
+    let wide = app.step == Step::Preview;
+    let want = if wide { PREVIEW_WIDTH } else { CARD_WIDTH };
+    let width = want.min(area.width);
+    let height = if wide {
+        area.height
+    } else {
+        card_height(app).min(area.height)
+    };
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::FOCUS))
+        .style(Style::default().bg(theme::SURFACE))
+        .title_top(Span::styled(
+            format!(" {} ", app.step.title()),
+            theme::heading(),
+        ))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    match app.step {
+        Step::Folder => draw_folder(frame, app, inner),
+        Step::Rules => draw_rules(frame, app, inner),
+        Step::Preview => draw_preview(frame, app, inner),
+        Step::Apply => draw_apply(frame, app, inner),
+    }
+}
+
+/// Rows the fixed-size cards take, borders and padding included.
+fn card_height(app: &App) -> u16 {
+    match app.step {
+        Step::Folder => 11,
+        Step::Rules => 13,
+        Step::Apply => 11,
+        Step::Preview => 20,
+    }
+}
+
+/// Render `rows` from the top of `area`, registering every clickable one.
+fn render_rows(frame: &mut Frame, app: &mut App, area: Rect, mut rows: Vec<Row>) {
+    for (offset, row) in rows.iter_mut().enumerate().take(area.height as usize) {
+        let rect = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+        if let Some(hit) = row.hit {
+            app.hits.push((rect, hit));
+            let under = hovered(app.hover, rect);
+            if under {
+                if row.filled {
+                    for span in &mut row.line.spans {
+                        span.style.bg = span.style.bg.map(theme::hovered_fill);
+                    }
+                } else {
+                    frame.render_widget(
+                        Block::new().style(Style::default().bg(theme::SELECTION_BACKGROUND)),
+                        rect,
+                    );
+                }
+            }
+        }
+        frame.render_widget(Paragraph::new(row.line.clone()), rect);
+    }
+}
+
+/// A row that spans the card and is filled when it holds the keyboard.
+fn control_row(text: Line<'static>, focused: bool, width: usize) -> Row {
+    let background = if focused {
+        theme::SELECTION_BACKGROUND
+    } else {
+        theme::SURFACE
+    };
+    let mut spans = vec![Span::styled(
+        caret(focused),
+        Style::default().fg(theme::FOCUS).bg(background),
+    )];
+    let mut used = CARET.width();
+    for span in text.spans {
+        used += span.content.width();
+        spans.push(Span::styled(span.content, span.style.bg(background)));
+    }
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used)),
+        Style::default().bg(background),
+    ));
+    Row::text(Line::from(spans)).filled()
+}
+
+fn caret(focused: bool) -> String {
+    if focused {
+        CARET.to_string()
+    } else {
+        " ".repeat(CARET.width())
+    }
+}
+
+fn heading_row(text: &str) -> Row {
+    Row::text(Line::from(vec![
+        Span::raw(" ".repeat(CARET.width())),
+        Span::styled(text.to_string(), theme::faint()),
+    ]))
+}
+
+// --------------------------------------------------------------- step 1: folder
+
+fn draw_folder(frame: &mut Frame, app: &mut App, area: Rect) {
+    let width = area.width as usize;
+    let focused = app.is_focused(Control::Path);
+    let field_width = width.saturating_sub(CARET.width());
+    let (visible, cursor) = app.directory.view(field_width);
+    let empty = visible.is_empty();
+    let text = if empty {
+        "~/Videos/Some.Show".to_string()
+    } else {
+        visible
+    };
+    let style = if empty {
+        theme::faint()
+    } else {
+        Style::default().fg(theme::FOREGROUND)
+    };
+
+    let rows = vec![
+        heading_row("Folder to scan"),
+        control_row(
+            Line::from(Span::styled(pad(&text, field_width), style)),
+            focused,
+            width,
+        )
+        .on(Hit::Control(Control::Path)),
+        Row::blank(),
+        control_row(
+            button_line("Browse", "o"),
+            app.is_focused(Control::Browse),
+            width,
+        )
+        .on(Hit::Control(Control::Browse)),
+        control_row(
+            button_line("Demo library", "d"),
+            app.is_focused(Control::Demo),
+            width,
+        )
+        .on(Hit::Control(Control::Demo)),
+    ];
+    render_rows(frame, app, area, rows);
+
+    // The real terminal cursor, so the path field blinks like every other prompt.
+    if focused && area.height > 1 {
+        let x = area.x + CARET.width() as u16 + cursor as u16;
+        frame.set_cursor_position(Position::new(x.min(area.right() - 1), area.y + 1));
+    }
+
+    draw_card_buttons(
+        frame,
+        app,
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+    );
+}
+
+// ---------------------------------------------------------------- step 2: rules
+
+fn draw_rules(frame: &mut Frame, app: &mut App, area: Rect) {
+    let width = area.width as usize;
+    let on_levels = app.is_focused(Control::Level);
+    let mut rows = vec![heading_row("Match level")];
+    for (index, level) in MatchLevel::ALL.into_iter().enumerate() {
+        let chosen = level == app.level;
+        let marker = if chosen { "(●) " } else { "( ) " };
+        let label_style = if chosen {
+            Style::default()
+                .fg(theme::FOREGROUND)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::MUTED)
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if chosen { theme::FOCUS } else { theme::FAINT }),
+            ),
+            Span::styled(pad(level.label(), 11), label_style),
+            Span::styled(level.hint().to_string(), theme::faint()),
+        ]);
+        rows.push(control_row(line, on_levels && chosen, width).on(Hit::LevelRow(index)));
+    }
+    rows.push(Row::blank());
+    rows.push(heading_row("Scope"));
+    let ticked = app.recursive;
+    rows.push(
+        control_row(
+            Line::from(vec![
+                Span::styled(
+                    if ticked { "[✓] " } else { "[ ] " },
+                    Style::default().fg(if ticked { theme::TICK } else { theme::FAINT }),
+                ),
+                Span::styled("Include subfolders", Style::default().fg(theme::FOREGROUND)),
+            ]),
+            app.is_focused(Control::Recursive),
+            width,
+        )
+        .on(Hit::Control(Control::Recursive)),
+    );
+    render_rows(frame, app, area, rows);
+    draw_card_buttons(
+        frame,
+        app,
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+    );
+}
+
+// -------------------------------------------------------------- step 3: preview
+
+fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.scanning {
+        let message = format!(
+            "{} Scanning {}",
+            SPINNER[app.ticks % SPINNER.len()],
+            app.directory.value()
+        );
+        draw_centred(
+            frame,
+            area,
+            &fit(&message, area.width as usize),
+            theme::WORKING,
+        );
+        return;
+    }
+    let Some(preview) = app.preview.as_ref() else {
+        draw_centred(
+            frame,
+            area,
+            "No preview yet — press ← and preview again",
+            theme::FAINT,
+        );
+        return;
+    };
+
+    let matched = preview.prepared.len();
+    let ticked = preview.ticked_count();
+    let skipped = preview.plan.skipped.len();
+    let is_demo = preview.is_demo;
+
+    // Summary on the left, the two bulk keys on the right: four numbers do not
+    // need four boxes, and the keys belong beside the list they act on.
+    let mut summary = vec![
+        Span::styled(
+            format!("{ticked}"),
+            Style::default()
+                .fg(theme::TICK)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" of {matched} ticked"), theme::muted()),
+    ];
+    if is_demo {
+        summary.push(Span::styled(
+            "  ·  demo, nothing is written",
+            Style::default().fg(theme::DEMO),
+        ));
+    }
+    let summary_line = Line::from(summary);
+    frame.render_widget(
+        Paragraph::new(summary_line),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let mut right: Vec<(Hit, String)> = vec![
+        (Hit::TickAll, "all ^a".into()),
+        (Hit::TickNone, "none ^r".into()),
+    ];
+    if skipped > 0 {
+        right.insert(0, (Hit::Skipped, format!("{skipped} skipped  s")));
+    }
+    let mut x = area.right();
+    for (hit, label) in right.iter().rev() {
+        let width = label.width() as u16 + 2;
+        if x < area.x + width {
+            break;
+        }
+        x -= width;
+        let rect = Rect::new(x, area.y, width, 1);
+        let under = hovered(app.hover, rect);
+        let background = if under {
+            theme::SELECTION_BACKGROUND
+        } else {
+            theme::SURFACE
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {label} "),
+                Style::default().fg(theme::FAINT).bg(background),
+            ))),
+            rect,
+        );
+        app.hits.push((rect, *hit));
+    }
+
+    // The list, the full path of the highlighted row, then the buttons.
+    let [_, _, list_area, _, detail_area, buttons_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    if matched == 0 {
+        draw_centred(
+            frame,
+            list_area,
+            "Nothing matched — press ← and loosen the match level",
+            theme::FAINT,
+        );
+    } else {
+        let width = list_area.width as usize;
+        let items: Vec<ListItem> = preview
+            .prepared
+            .iter()
+            .enumerate()
+            .map(|(index, prepared)| {
+                ListItem::new(operation_line(
+                    prepared,
+                    preview.ticked[index],
+                    &preview.plan,
+                    width,
+                ))
+            })
+            .collect();
+        let selected = preview.state.selected();
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .bg(theme::SELECTION_BACKGROUND)
+                .add_modifier(Modifier::BOLD),
+        );
+        let mut state = preview.state;
+        frame.render_stateful_widget(list, list_area, &mut state);
+        let offset = state.offset();
+        app.preview.as_mut().unwrap().state = state;
+
+        for visible in 0..list_area.height as usize {
+            let index = offset + visible;
+            if index >= matched {
+                break;
+            }
+            app.hits.push((
+                Rect::new(
+                    list_area.x,
+                    list_area.y + visible as u16,
+                    list_area.width,
+                    1,
+                ),
+                Hit::Row(index),
+            ));
+        }
+
+        // The detail line spells the highlighted row out in full: the list trims
+        // long paths from the left, and this is where the whole one is readable.
+        if let Some(index) = selected {
+            let preview = app.preview.as_ref().unwrap();
+            if let Some(prepared) = preview.prepared.get(index) {
+                let text = format!(
+                    "{}  →  {}",
+                    display_path(prepared.source(), &preview.plan.root),
+                    crate::paths::file_name(prepared.destination())
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        fit(&text, detail_area.width as usize),
+                        theme::faint(),
+                    ))),
+                    detail_area,
+                );
+            }
+        }
+    }
+
+    draw_card_buttons(frame, app, buttons_area);
+}
+
+fn operation_line(
+    prepared: &PreparedOperation,
+    ticked: bool,
+    plan: &RenamePlan,
+    width: usize,
+) -> Line<'static> {
+    let badge = match_badge(&prepared.operation.reason);
+    let certain = matches!(prepared.operation.reason, MatchReason::Episode(_));
+    let mark = if ticked { "[✓] " } else { "[ ] " };
+    let body = format!(
+        "{}  →  {}",
+        display_path(prepared.source(), &plan.root),
+        crate::paths::file_name(prepared.destination())
+    );
+    let room = width.saturating_sub(mark.width() + badge.width() + 2);
+    let body = fit(&body, room);
+    let gap = width.saturating_sub(mark.width() + body.width() + badge.width());
+    Line::from(vec![
+        Span::styled(
+            mark,
+            Style::default().fg(if ticked { theme::TICK } else { theme::FAINT }),
+        ),
+        Span::styled(body, Style::default().fg(theme::FOREGROUND)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(
+            badge,
+            if certain {
+                Style::default().fg(theme::CERTAIN)
+            } else {
+                theme::faint()
+            },
+        ),
+    ])
+}
+
+// ---------------------------------------------------------------- step 4: apply
+
+fn draw_apply(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (done, total) = app.progress;
+    if app.applying {
+        let bar_width = (area.width as usize).saturating_sub(12).max(4);
+        let filled = (bar_width * done).checked_div(total).unwrap_or(0);
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("{} Renaming…", SPINNER[app.ticks % SPINNER.len()]),
+                Style::default().fg(theme::WORKING),
+            )),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("█".repeat(filled), Style::default().fg(theme::SUCCESS)),
+                Span::styled(
+                    "░".repeat(bar_width - filled),
+                    Style::default().fg(theme::BORDER),
+                ),
+                Span::styled(format!("  {done} / {total}"), theme::muted()),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let (glyph, colour, headline, detail) = match app.outcome.as_ref() {
+        Some(Outcome::Done { applied }) => (
+            "✓",
+            theme::SUCCESS,
+            format!("Renamed {applied} {}", plural(*applied, "file", "files")),
+            String::new(),
+        ),
+        Some(Outcome::Mixed {
+            applied,
+            failed,
+            error,
+        }) => (
+            "!",
+            theme::ERROR,
+            format!(
+                "Renamed {applied}, {failed} {} failed",
+                plural(*failed, "rename", "renames")
+            ),
+            error.clone(),
+        ),
+        Some(Outcome::Refused { reason }) => (
+            "✗",
+            theme::ERROR,
+            "Nothing was renamed".into(),
+            reason.clone(),
+        ),
+        None => ("", theme::FAINT, "Nothing to report".into(), String::new()),
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            glyph,
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ))
+        .centered(),
+        Line::default(),
+        Line::from(Span::styled(headline, Style::default().fg(colour))).centered(),
+    ];
+    if !detail.is_empty() {
+        for line in wrap(&detail, area.width as usize) {
+            lines.push(Line::from(Span::styled(line, theme::faint())).centered());
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+    draw_card_buttons(
+        frame,
+        app,
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+    );
+}
+
+// -------------------------------------------------------------- card buttons
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ButtonKind {
     Primary,
     Confirm,
@@ -488,9 +832,6 @@ impl ButtonKind {
 }
 
 /// A button reads `Label (k)`: what it does first, the key that does it after.
-///
-/// The two are separate spans so the key can sit back a shade without breaking
-/// the fill, and the whole thing is padded to a fixed shape by its caller.
 fn button_spans(label: &str, key: &str, kind: ButtonKind, hovered: bool) -> [Span<'static>; 2] {
     let (fill, foreground) = kind.colours();
     let fill = if hovered {
@@ -505,6 +846,14 @@ fn button_spans(label: &str, key: &str, kind: ButtonKind, hovered: bool) -> [Spa
     ]
 }
 
+/// The same shape inline, for a card row that acts rather than toggles.
+fn button_line(label: &str, key: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label.to_string(), Style::default().fg(theme::FOREGROUND)),
+        Span::styled(format!(" ({key})"), theme::faint()),
+    ])
+}
+
 /// Columns [`button_spans`] takes, plus the padding a free-standing button gets.
 fn button_width(label: &str, key: &str) -> usize {
     label.width() + key.width() + 3 + 2 * BUTTON_PADDING
@@ -513,552 +862,142 @@ fn button_width(label: &str, key: &str) -> usize {
 /// Blank columns held either side of a button's text.
 const BUTTON_PADDING: usize = 2;
 
-impl SetupRow {
-    fn text(line: Line<'static>) -> Self {
-        Self {
-            line,
-            style: Style::default().bg(theme::SURFACE),
-            inset: 0,
-            hit: None,
-        }
+/// The bottom row of a card: back on the left, the way forward on the right.
+///
+/// The direction of the wizard is the direction of the buttons, so a glance at
+/// the card says which way the workflow runs without reading a word.
+fn draw_card_buttons(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.height == 0 {
+        return;
     }
-
-    fn blank() -> Self {
-        Self::text(Line::default())
-    }
-
-    fn input(text: &str, empty: bool, focused: bool) -> Self {
-        let content = if empty && !focused {
-            Span::styled("Type or paste a directory path", theme::faint())
-        } else {
-            Span::styled(text.to_string(), Style::default().fg(theme::FOREGROUND))
-        };
-        Self {
-            line: Line::from(vec![
-                Span::styled(caret(focused), Style::default().fg(theme::FOCUS)),
-                content,
-            ]),
-            style: Style::default().bg(if focused {
-                theme::SELECTION_BACKGROUND
-            } else {
-                theme::PANEL
-            }),
-            inset: 0,
-            hit: None,
-        }
-    }
-
-    fn switch(on: bool, label: &str, focused: bool, width: usize) -> Self {
-        let marker = if on {
-            Span::styled("[✓] ", Style::default().fg(theme::TICK))
-        } else {
-            Span::styled("[ ] ", theme::faint())
-        };
-        Self::control(marker, label, focused, "space", width)
-    }
-
-    fn radio(selected: bool, label: &str, focused: bool, width: usize) -> Self {
-        let marker = if selected {
-            Span::styled("(●) ", Style::default().fg(theme::FOCUS))
-        } else {
-            Span::styled("( ) ", theme::faint())
-        };
-        Self::control(marker, label, focused && selected, "", width)
-    }
-
-    /// A checkbox or radio row: caret, marker, label, and — while it holds the
-    /// keyboard — the key that changes it, spelled out at the end of the row.
-    fn control(
-        marker: Span<'static>,
-        label: &str,
-        highlighted: bool,
-        hint: &str,
-        width: usize,
-    ) -> Self {
-        let label_style = if highlighted {
-            Style::default()
-                .fg(theme::FOREGROUND)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::MUTED)
-        };
-        let hint = if highlighted { hint } else { "" };
-        let room = width.saturating_sub(CARET.width() + 4);
-        let mut spans = vec![
-            Span::styled(caret(highlighted), Style::default().fg(theme::FOCUS)),
-            marker,
-            Span::styled(pad(label, room.saturating_sub(hint.width())), label_style),
-        ];
-        if !hint.is_empty() {
-            spans.push(Span::styled(hint.to_string(), theme::faint()));
-        }
-        Self {
-            line: Line::from(spans),
-            style: Style::default().bg(if highlighted {
-                theme::SELECTION_BACKGROUND
-            } else {
-                theme::SURFACE
-            }),
-            inset: 0,
-            hit: None,
-        }
-    }
-
-    /// A full-width button, held off the panel edges so it reads as a control
-    /// sitting on the column rather than a band painted across it.
-    fn button(key: &str, label: &str, kind: ButtonKind, width: usize) -> Self {
-        let fill = kind.colours().0;
-        let inner = width.saturating_sub(2 * BUTTON_MARGIN);
-        let text = label.width() + key.width() + 3;
-        let left = inner.saturating_sub(text) / 2;
-        let margin = || {
-            Span::styled(
-                " ".repeat(BUTTON_MARGIN),
-                Style::default().bg(theme::SURFACE),
-            )
-        };
-        let pad = |columns: usize| Span::styled(" ".repeat(columns), Style::default().bg(fill));
-
-        let mut spans = vec![margin(), pad(left)];
-        spans.extend(button_spans(label, key, kind, false));
-        spans.push(pad(inner.saturating_sub(left + text)));
-        spans.push(margin());
-        Self {
-            line: Line::from(spans),
-            style: Style::default().bg(theme::SURFACE),
-            inset: BUTTON_MARGIN as u16,
-            hit: None,
-        }
-    }
-}
-
-/// Columns of panel left bare either side of a full-width button.
-const BUTTON_MARGIN: usize = 1;
-
-/// The mark in front of whatever holds the keyboard, in every list on screen.
-const CARET: &str = "▸ ";
-
-fn caret(focused: bool) -> String {
-    if focused {
-        CARET.to_string()
-    } else {
-        " ".repeat(CARET.width())
-    }
-}
-
-fn label_line(text: &str, focused: bool, hint: &str, width: usize) -> Line<'static> {
-    let style = if focused {
-        Style::default()
-            .fg(theme::FOCUS)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::MUTED)
-    };
-    // Headings take the indent of the rows below them but never the caret: that
-    // marks a row the keyboard is on, and a heading is not one.
-    let mut spans = vec![
-        Span::raw(" ".repeat(CARET.width())),
-        Span::styled(text.to_string(), style),
-    ];
-    if focused && !hint.is_empty() {
-        let room = width.saturating_sub(CARET.width() + text.width() + hint.width());
-        spans.push(Span::raw(" ".repeat(room)));
-        spans.push(Span::styled(hint.to_string(), theme::faint()));
-    }
-    Line::from(spans)
-}
-
-fn hint_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("{}{text}", " ".repeat(CARET.width())),
-        theme::faint(),
-    ))
-}
-
-// ------------------------------------------------------------ results column
-
-fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
-    let [summary_area, list_area, detail_area] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(3),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
-    draw_summary(frame, app, summary_area);
-
-    // The tab chips sit on the top border; measure them off the same strings
-    // the title draws, so a click lands exactly on what is painted.
-    let (matched, skipped) = tab_counts(app);
-    let (matched_chip, skipped_chip) = (chip("To rename", matched), chip("Skipped", skipped));
-    let mut x = list_area.x + 1;
-    let matched_strip = Rect::new(x, list_area.y, matched_chip.width() as u16, 1);
-    x += matched_strip.width + 1;
-    let skipped_strip = Rect::new(x, list_area.y, skipped_chip.width() as u16, 1);
-    app.hits.push((matched_strip, Hit::Tab(Tab::Matched)));
-    app.hits.push((skipped_strip, Hit::Tab(Tab::Skipped)));
-
-    let mut block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme::border(app.focus == Focus::Results))
-        .style(Style::default().bg(theme::SURFACE))
-        .title_top(tab_line(
+    let controls = app.controls();
+    if let Some(index) = controls.iter().position(|item| *item == Control::Back) {
+        let focused = app.focus == index;
+        draw_button(
+            frame,
             app,
-            hovered(app.hover, matched_strip),
-            hovered(app.hover, skipped_strip),
-        ))
-        .padding(Padding::horizontal(1));
-    // Ticking every row or none of them is a chord, so it gets clickable chips
-    // on the box it acts on. The footer no longer repeats them.
-    if app.tab == Tab::Matched
-        && list_area.height >= 3
-        && app.preview.as_ref().is_some_and(|p| !p.prepared.is_empty())
-    {
-        const ALL: &str = " Tick all (^a) ";
-        const NONE: &str = " Tick none (^r) ";
-        let y = list_area.bottom() - 1;
-        let all_strip = Rect::new(list_area.x + 1, y, ALL.width() as u16, 1);
-        let none_strip = Rect::new(all_strip.right() + 1, y, NONE.width() as u16, 1);
-        block = block.title_bottom(Line::from(vec![
-            chip_span(ALL, hovered(app.hover, all_strip), theme::SURFACE),
-            Span::raw(" "),
-            chip_span(NONE, hovered(app.hover, none_strip), theme::SURFACE),
-        ]));
-        app.hits.push((all_strip, Hit::TickAll));
-        app.hits.push((none_strip, Hit::TickNone));
-    }
-    let inner = block.inner(list_area);
-    frame.render_widget(block, list_area);
-
-    match app.tab {
-        Tab::Matched => draw_matched(frame, app, inner),
-        Tab::Skipped => draw_skipped(frame, app, inner),
-    }
-    draw_detail(frame, app, detail_area);
-}
-
-fn tab_counts(app: &App) -> (usize, usize) {
-    app.preview.as_ref().map_or((0, 0), |preview| {
-        (preview.prepared.len(), preview.plan.skipped.len())
-    })
-}
-
-/// The painted text of a tab chip, shared by the title and its click strip.
-fn chip(label: &str, count: usize) -> String {
-    format!(" {label} ({count}) ")
-}
-
-fn tab_line(app: &App, matched_hover: bool, skipped_hover: bool) -> Line<'static> {
-    let (matched, skipped) = tab_counts(app);
-    // The open tab is a filled chip rather than just bold text, so which of the
-    // two lists is on screen reads at a glance. Under the pointer an inactive
-    // chip takes the same fill without the bold: clickable, but not where the
-    // keyboard is.
-    let style = |active: bool, under_pointer: bool| {
-        if active {
-            Style::default()
-                .fg(theme::FOREGROUND)
-                .bg(theme::SELECTION_BACKGROUND)
-                .add_modifier(Modifier::BOLD)
-        } else if under_pointer {
-            Style::default()
-                .fg(theme::FOREGROUND)
-                .bg(theme::SELECTION_BACKGROUND)
-        } else {
-            theme::faint()
-        }
-    };
-    let mut spans = vec![
-        Span::styled(
-            chip("To rename", matched),
-            style(app.tab == Tab::Matched, matched_hover),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            chip("Skipped", skipped),
-            style(app.tab == Tab::Skipped, skipped_hover),
-        ),
-    ];
-    if app.focus == Focus::Results {
-        spans.push(Span::styled(" ←→ ", theme::faint()));
-    }
-    Line::from(spans)
-}
-
-fn draw_summary(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(preview) = app.preview.as_ref() else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("No preview yet", theme::faint()))),
             area,
+            false,
+            "← Back",
+            "esc",
+            if focused {
+                ButtonKind::Primary
+            } else {
+                ButtonKind::Neutral
+            },
+            Hit::Control(Control::Back),
         );
-        return;
-    };
-    let plan = &preview.plan;
-    let mut spans = vec![
-        count_span(plan.video_count, "video", "videos", theme::FOREGROUND),
-        Span::styled(" · ", theme::faint()),
-        count_span(
-            plan.subtitle_count,
-            "subtitle",
-            "subtitles",
-            theme::FOREGROUND,
+    }
+
+    let (control, label, key, kind) = match app.step {
+        Step::Folder => (Control::Advance, "Next →", "↵", ButtonKind::Primary),
+        Step::Rules => (Control::Advance, "Preview →", "↵", ButtonKind::Primary),
+        Step::Preview => (
+            Control::Advance,
+            "Apply",
+            "a",
+            if app.can_apply() {
+                ButtonKind::Confirm
+            } else {
+                ButtonKind::Disabled
+            },
         ),
-        Span::styled(" · ", theme::faint()),
-        count_span(plan.operations.len(), "matched", "matched", theme::CERTAIN),
-        Span::styled(" · ", theme::faint()),
-        count_span(plan.skipped.len(), "skipped", "skipped", theme::WORKING),
-        Span::styled(" · ", theme::faint()),
-        count_span(plan.directory_count, "folder", "folders", theme::MUTED),
-    ];
-    if !preview.prepared.is_empty() {
-        spans.push(Span::styled(" · ", theme::faint()));
-        spans.push(Span::styled(
-            format!(
-                "{} of {} ticked",
-                preview.ticked_count(),
-                preview.prepared.len()
-            ),
-            Style::default().fg(theme::TICK),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn count_span(count: usize, one: &str, many: &str, colour: Color) -> Span<'static> {
-    let word = plural(count, one, many);
-    Span::styled(format!("{count} {word}"), Style::default().fg(colour))
-}
-
-fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(preview) = app.preview.as_mut() else {
-        frame.render_widget(placeholder("Preview a folder, or press d for a demo"), area);
-        return;
+        Step::Apply => (Control::Again, "Start over", "↵", ButtonKind::Primary),
     };
-    if preview.prepared.is_empty() {
-        frame.render_widget(placeholder("Nothing to rename"), area);
+    if !controls.contains(&control) {
         return;
     }
-
-    // The caret takes a column from every row, highlighted or not.
-    let width = (area.width as usize).saturating_sub(CARET.width());
-    // Hover tinting needs each visible row's rectangle before the list is
-    // rendered, so it works off the offset of the previous frame; a frame that
-    // scrolls redraws immediately anyway.
-    let count = preview.prepared.len();
-    let assumed_offset = preview.matched_state.offset();
-    let rows_on_screen = area.height as usize;
-    let items: Vec<ListItem> = preview
-        .prepared
-        .iter()
-        .zip(&preview.ticked)
-        .enumerate()
-        .map(|(index, (prepared, ticked))| {
-            let item = ListItem::new(operation_line(prepared, *ticked, &preview.plan, width));
-            match hover_style(app.hover, area, 0, assumed_offset, rows_on_screen, index) {
-                Some(style) => item.style(style),
-                None => item,
-            }
-        })
-        .collect();
-    let list = List::new(items).highlight_symbol(CARET).highlight_style(
-        Style::default()
-            .bg(theme::SELECTION_BACKGROUND)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, area, &mut preview.matched_state);
-
-    // Register from the offset as rendered, so clicks land on what is shown.
-    register_rows(
-        &mut app.hits,
+    draw_button(
+        frame,
+        app,
         area,
-        0,
-        preview.matched_state.offset(),
-        rows_on_screen,
-        count,
-        Hit::MatchedRow,
+        true,
+        label,
+        key,
+        kind,
+        Hit::Control(control),
     );
 }
 
-/// `[✓] source → target        badge`, with the badge pushed to the right.
-fn operation_line(
-    prepared: &PreparedOperation,
-    ticked: bool,
-    plan: &RenamePlan,
-    width: usize,
-) -> Line<'static> {
-    let (marker, marker_style) = if ticked {
-        ("[✓] ", Style::default().fg(theme::TICK))
+#[allow(clippy::too_many_arguments)]
+fn draw_button(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    right: bool,
+    label: &str,
+    key: &str,
+    kind: ButtonKind,
+    hit: Hit,
+) {
+    let width = button_width(label, key) as u16;
+    if width > area.width {
+        return;
+    }
+    let x = if right { area.right() - width } else { area.x };
+    let rect = Rect::new(x, area.y, width, 1);
+    let under = hovered(app.hover, rect);
+    let fill = if under {
+        theme::hovered_fill(kind.colours().0)
     } else {
-        ("[ ] ", theme::faint())
+        kind.colours().0
     };
-    let badge = match_badge(&prepared.operation.reason);
-    let badge_style = match prepared.operation.reason {
-        // An episode id is as good as certain, so it can be read at a glance;
-        // a fuzzy score is the one a person should actually look at, so it stays
-        // quiet rather than shouting for attention.
-        MatchReason::Episode(_) => Style::default().fg(theme::CERTAIN),
-        MatchReason::Fuzzy(_) => theme::faint(),
-    };
-
-    let source = display_path(prepared.source(), &plan.root);
-    let target = prepared
-        .destination()
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let available = width.saturating_sub(marker.width() + badge.width() + 2);
-    let body = fit(&format!("{source} → {target}"), available);
-    let gap = available.saturating_sub(body.width()) + 2;
-
-    Line::from(vec![
-        Span::styled(marker, marker_style),
-        Span::styled(body, Style::default().fg(theme::FOREGROUND)),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(badge, badge_style),
-    ])
+    let pad = Span::styled(" ".repeat(BUTTON_PADDING), Style::default().bg(fill));
+    let mut spans = vec![pad.clone()];
+    spans.extend(button_spans(label, key, kind, under));
+    spans.push(pad);
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    app.hits.push((rect, hit));
 }
 
-fn draw_skipped(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(preview) = app.preview.as_mut() else {
-        frame.render_widget(placeholder("Preview a folder, or press d for a demo"), area);
-        return;
-    };
-    if preview.plan.skipped.is_empty() {
-        frame.render_widget(placeholder("Nothing was skipped"), area);
+/// A single line of text, centred in both directions.
+fn draw_centred(frame: &mut Frame, area: Rect, text: &str, colour: Color) {
+    if area.height == 0 {
         return;
     }
-
-    let root = preview.plan.root.clone();
-    // The header takes the first line, so data rows start one below; hover and
-    // click rectangles follow it.
-    let assumed_offset = preview.skipped_state.offset();
-    let count = preview.plan.skipped.len();
-    let rows_on_screen = area.height.saturating_sub(1) as usize;
-    let rows: Vec<Row> = preview
-        .plan
-        .skipped
-        .iter()
-        .enumerate()
-        .map(|(index, skipped)| {
-            let row = Row::new(vec![
-                Cell::from(display_path(&skipped.path, &root))
-                    .style(Style::default().fg(theme::FOREGROUND)),
-                Cell::from(skip_label(&skipped.reason)).style(theme::muted()),
-            ]);
-            match hover_style(app.hover, area, 1, assumed_offset, rows_on_screen, index) {
-                Some(style) => row.style(style),
-                None => row,
-            }
-        })
-        .collect();
-    let table = Table::new(
-        rows,
-        [Constraint::Percentage(60), Constraint::Percentage(40)],
-    )
-    .header(Row::new(vec!["Source", "Reason"]).style(theme::faint().add_modifier(Modifier::BOLD)))
-    .highlight_symbol(CARET)
-    .row_highlight_style(Style::default().bg(theme::SELECTION_BACKGROUND));
-    frame.render_stateful_widget(table, area, &mut preview.skipped_state);
-
-    register_rows(
-        &mut app.hits,
-        area,
-        1,
-        preview.skipped_state.offset(),
-        rows_on_screen,
-        count,
-        Hit::SkippedRow,
+    let rect = Rect::new(area.x, area.y + area.height / 2, area.width, 1);
+    frame.render_widget(
+        Paragraph::new(
+            Line::from(Span::styled(text.to_string(), Style::default().fg(colour))).centered(),
+        ),
+        rect,
     );
-}
-
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
-    // List rows elide long paths, so the highlighted one is always spelled out
-    // here in full.
-    let text = app.preview.as_ref().and_then(|preview| match app.tab {
-        Tab::Matched => {
-            let index = preview.matched_state.selected()?;
-            let prepared = preview.prepared.get(index)?;
-            Some(format!(
-                "{}  →  {}",
-                display_path(prepared.source(), &preview.plan.root),
-                display_path(prepared.destination(), &preview.plan.root)
-            ))
-        }
-        Tab::Skipped => {
-            let index = preview.skipped_state.selected()?;
-            let skipped = preview.plan.skipped.get(index)?;
-            Some(format!(
-                "{}  —  {}",
-                display_path(&skipped.path, &preview.plan.root),
-                skip_label(&skipped.reason)
-            ))
-        }
-    });
-    let line = Line::from(Span::styled(text.unwrap_or_default(), theme::muted()));
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn placeholder(text: &str) -> Paragraph<'static> {
-    Paragraph::new(Line::from(Span::styled(text.to_string(), theme::faint())))
-        .alignment(Alignment::Center)
 }
 
 // ------------------------------------------------------------------- modals
 
-/// Every dialog is the same width, so they never jump around between steps.
 const DIALOG_WIDTH: u16 = 72;
 
-/// Every key, grouped by what it is for, with the vim spelling beside the arrows.
 fn draw_help(frame: &mut Frame, area: Rect, hover: Option<Position>, hits: &mut Vec<(Rect, Hit)>) {
-    let shortcuts: [(&str, &str); 15] = [
-        ("tab / shift+tab", "Next / previous control"),
-        ("↑ ↓  or  k j", "Move in a control, and between them"),
-        ("← →  or  h l", "Set the option, or switch tab"),
-        ("home end / g G", "First / last row"),
-        ("ctrl+d/u  ctrl+f/b", "Half a page, or a whole one"),
-        ("i / esc", "Enter / leave the path field"),
-        ("space", "Tick or untick the highlighted rename"),
-        ("enter", "Preview from the path field, else as space"),
-        ("ctrl+a / ctrl+r", "Tick everything / nothing"),
-        ("p", "Preview"),
+    const SHORTCUTS: [(&str, &str); 12] = [
+        ("↵", "Forward, from wherever the keyboard is"),
+        ("← →   h l", "Back and forward through the four steps"),
+        ("↑ ↓   k j", "Move inside the step"),
+        ("↹  ⇧↹", "Next / previous control"),
+        ("␣", "Press the focused control in place"),
+        ("^a  ^r", "Tick everything / nothing"),
+        ("g  G", "First / last rename"),
+        ("s", "The subtitles that were skipped, and why"),
+        ("o", "Browse for a folder"),
+        ("d", "Demo library — looks real, writes nothing"),
         ("a", "Apply the ticked renames"),
-        ("d", "Demo mode"),
-        ("o", "Browse for a directory"),
-        ("?", "This list"),
-        ("q", "Quit"),
+        ("?  q", "This list · quit"),
     ];
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Workflow: path → enter or p to preview → space to tick → a to apply",
-            theme::muted(),
-        )),
-        Line::default(),
-    ];
-    lines.extend(shortcuts.iter().map(|(key, description)| {
-        Line::from(vec![
-            Span::styled(format!("{key:<20}"), theme::key()),
-            Span::styled(
-                (*description).to_string(),
-                Style::default().fg(theme::FOREGROUND),
-            ),
-        ])
-    }));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "In the path field letters type: ctrl+a/e jump, ctrl+u/k/w delete.",
-        theme::faint(),
-    )));
-
-    let popup = centered(area, DIALOG_WIDTH, lines.len() as u16 + 4);
+    let mut lines: Vec<Line> = Vec::new();
+    for (keys, meaning) in SHORTCUTS {
+        lines.push(Line::from(vec![
+            Span::styled(pad(keys, 12), theme::key()),
+            Span::styled(meaning.to_string(), theme::muted()),
+        ]));
+    }
+    let height = lines.len() as u16 + 5;
+    let rect = centered(area, DIALOG_WIDTH, height);
     render_dialog(
         frame,
-        popup,
+        rect,
         " Keyboard shortcuts ",
         Text::from(lines),
-        &[(Hit::HelpClose, "Close", "esc", ButtonKind::Neutral)],
+        &[(Hit::CloseModal, "Close", "esc", ButtonKind::Primary)],
         hover,
         hits,
     );
@@ -1075,44 +1014,127 @@ fn draw_confirm(
     let mut lines = vec![
         Line::from(Span::styled(
             format!(
-                "About to rename {count} subtitle {}.",
-                plural(count, "file", "files")
+                "Rename {count} {} on disk.",
+                plural(count, "subtitle", "subtitles")
             ),
             Style::default().fg(theme::FOREGROUND),
         )),
-        Line::from(Span::styled(
-            "Existing files are never overwritten.",
-            theme::muted(),
-        )),
         Line::default(),
     ];
-    // Wrapped here rather than by the paragraph, so the dialog is sized for the
-    // rows it actually needs and a long rename is never cut off at the bottom.
-    lines.extend(
-        examples
-            .iter()
-            .flat_map(|example| wrap(example, DIALOG_WIDTH as usize - 2))
-            .map(|line| Line::from(Span::styled(line, theme::muted()))),
-    );
+    for example in examples {
+        lines.push(Line::from(Span::styled(
+            fit(example, DIALOG_WIDTH as usize - 4),
+            theme::muted(),
+        )));
+    }
     if count > examples.len() {
         lines.push(Line::from(Span::styled(
             format!("… and {} more", count - examples.len()),
             theme::faint(),
         )));
     }
-
-    let popup = centered(area, DIALOG_WIDTH, lines.len() as u16 + 4);
+    let height = lines.len() as u16 + 5;
+    let rect = centered(area, DIALOG_WIDTH, height);
     render_dialog(
         frame,
-        popup,
+        rect,
         " Confirm apply ",
         Text::from(lines),
         &[
             (Hit::ConfirmCancel, "Cancel", "esc", ButtonKind::Neutral),
-            (Hit::ConfirmApply, "Apply", "enter", ButtonKind::Confirm),
+            (Hit::ConfirmApply, "Apply", "↵", ButtonKind::Confirm),
         ],
         hover,
         hits,
+    );
+}
+
+/// The skipped subtitles, folded away behind one key until they are wanted.
+///
+/// A list rather than a paragraph, because a folder can skip more subtitles than
+/// a dialog has rows and the reader has to be able to walk them.
+fn draw_skipped(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(preview) = app.preview.as_ref() else {
+        return;
+    };
+    let root = preview.plan.root.clone();
+    let count = preview.plan.skipped.len();
+    let rect = centered(area, DIALOG_WIDTH + 8, (count as u16 + 6).min(area.height));
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::FOCUS))
+        .style(Style::default().bg(theme::PANEL))
+        .title_top(Span::styled(
+            format!(" Skipped ({count}) "),
+            theme::heading(),
+        ))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 3 {
+        return;
+    }
+    let [list_area, _, buttons_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let reason_width = 32.min(list_area.width as usize / 2);
+    let path_width = (list_area.width as usize).saturating_sub(reason_width + 2);
+    let items: Vec<ListItem> = preview
+        .plan
+        .skipped
+        .iter()
+        .map(|skipped| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    pad(
+                        &fit(&display_path(&skipped.path, &root), path_width),
+                        path_width + 2,
+                    ),
+                    Style::default().fg(theme::FOREGROUND),
+                ),
+                Span::styled(
+                    fit(&skip_label(&skipped.reason), reason_width),
+                    theme::faint(),
+                ),
+            ]))
+        })
+        .collect();
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(theme::SELECTION_BACKGROUND)
+            .add_modifier(Modifier::BOLD),
+    );
+    let hover = app.hover;
+    let Some(Modal::Skipped(state)) = app.modal.as_mut() else {
+        return;
+    };
+    frame.render_stateful_widget(list, list_area, state);
+    let offset = state.offset();
+    for visible in 0..list_area.height as usize {
+        if offset + visible >= count {
+            break;
+        }
+        app.hits.push((
+            Rect::new(
+                list_area.x,
+                list_area.y + visible as u16,
+                list_area.width,
+                1,
+            ),
+            Hit::Row(offset + visible),
+        ));
+    }
+    draw_dialog_buttons(
+        frame,
+        buttons_area,
+        &[(Hit::CloseModal, "Close", "esc", ButtonKind::Primary)],
+        hover,
+        &mut app.hits,
     );
 }
 
@@ -1123,107 +1145,99 @@ fn draw_picker(
     hover: Option<Position>,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
-    let popup = centered(area, DIALOG_WIDTH, 22);
-    frame.render_widget(Clear, popup);
+    let rect = centered(area, DIALOG_WIDTH, 18);
+    frame.render_widget(Clear, rect);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::FOCUS))
         .style(Style::default().bg(theme::PANEL))
-        .title_top(Span::styled(" Choose a directory ", theme::heading()))
-        .title_bottom(Span::styled(
-            " ↑↓/jk  move   enter/l  open ",
-            theme::faint(),
-        ))
+        .title_top(Span::styled(" Browse ", theme::heading()))
         .padding(Padding::horizontal(1));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let [current_area, list_area, _, buttons_area] = Layout::vertical([
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let [path_area, list_area, _, buttons_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
+
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            picker.current.to_string_lossy().into_owned(),
-            Style::default().fg(theme::FOREGROUND),
-        )))
-        .wrap(Wrap { trim: true }),
-        current_area,
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                fit(&picker.current.to_string_lossy(), path_area.width as usize),
+                Style::default().fg(theme::FOREGROUND),
+            )),
+            Line::default(),
+        ]),
+        path_area,
     );
 
-    // Going up a level, taking this folder and backing out are all keys
-    // otherwise, so each one gets a button; the buttons are drawn before the
-    // listing can bail out, because an unreadable folder is exactly when a way
-    // back up matters most.
+    if let Some(error) = picker.error.clone() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                error,
+                Style::default().fg(theme::ERROR),
+            )))
+            .wrap(Wrap { trim: false }),
+            list_area,
+        );
+    } else {
+        let items: Vec<ListItem> = picker
+            .entries
+            .iter()
+            .map(|entry| {
+                ListItem::new(Line::from(Span::styled(
+                    format!("  {}/", crate::paths::file_name(entry)),
+                    theme::muted(),
+                )))
+            })
+            .collect();
+        let empty = items.is_empty();
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .bg(theme::SELECTION_BACKGROUND)
+                .add_modifier(Modifier::BOLD),
+        );
+        frame.render_stateful_widget(list, list_area, &mut picker.state);
+        if empty {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "No subfolders here",
+                    theme::faint(),
+                ))),
+                list_area,
+            );
+        }
+        let offset = picker.state.offset();
+        for visible in 0..list_area.height as usize {
+            let index = offset + visible;
+            if index >= picker.entries.len() {
+                break;
+            }
+            hits.push((
+                Rect::new(
+                    list_area.x,
+                    list_area.y + visible as u16,
+                    list_area.width,
+                    1,
+                ),
+                Hit::PickerRow(index),
+            ));
+        }
+    }
+
     draw_dialog_buttons(
         frame,
         buttons_area,
         &[
-            (
-                Hit::PickerParent,
-                "Parent folder",
-                "h",
-                if picker.current.parent().is_some() {
-                    ButtonKind::Neutral
-                } else {
-                    ButtonKind::Disabled
-                },
-            ),
             (Hit::PickerCancel, "Cancel", "esc", ButtonKind::Neutral),
+            (Hit::PickerParent, "Parent", "←", ButtonKind::Neutral),
             (Hit::PickerUse, "Use this folder", "s", ButtonKind::Primary),
         ],
         hover,
         hits,
-    );
-
-    if let Some(error) = picker.error.clone() {
-        frame.render_widget(placeholder(&error), list_area);
-        return;
-    }
-    if picker.entries.is_empty() {
-        frame.render_widget(placeholder("No subfolders here"), list_area);
-        return;
-    }
-    let count = picker.entries.len();
-    let assumed_offset = picker.state.offset();
-    let rows_on_screen = list_area.height as usize;
-    let items: Vec<ListItem> = picker
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let name = entry
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let item = ListItem::new(Line::from(vec![
-                Span::styled("📁 ", theme::faint()),
-                Span::styled(name, Style::default().fg(theme::FOREGROUND)),
-            ]));
-            match hover_style(hover, list_area, 0, assumed_offset, rows_on_screen, index) {
-                Some(style) => item.style(style),
-                None => item,
-            }
-        })
-        .collect();
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(theme::SELECTION_BACKGROUND)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, list_area, &mut picker.state);
-
-    register_rows(
-        hits,
-        list_area,
-        0,
-        picker.state.offset(),
-        rows_on_screen,
-        count,
-        Hit::PickerRow,
     );
 }
 
@@ -1245,8 +1259,6 @@ fn render_dialog(
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // The buttons sit inside the dialog with a blank row above them, so they
-    // read as things to press rather than as a caption on the border.
     let [body_area, _, buttons_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -1273,9 +1285,8 @@ fn draw_dialog_buttons(
         return;
     }
     // Too narrow for the whole row, so the leftmost buttons give way one at a
-    // time. Dropping the lot would strand a mouse-only user inside the dialog
-    // with no way out, so the last one — the primary action — always stays and
-    // the keys of the dropped ones still work.
+    // time; the primary action always stays, so a mouse-only user is never
+    // stranded inside a dialog.
     let mut buttons = buttons;
     let width_of = |row: &[DialogButton]| -> u16 {
         row.iter()
@@ -1383,21 +1394,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fit_keeps_the_end_of_a_long_path() {
-        assert_eq!(fit("season one/episode.srt", 12), "…episode.srt");
-        assert_eq!(fit("short.srt", 12), "short.srt");
+    fn fit_keeps_the_filename_end() {
+        assert_eq!(fit("abcdef", 10), "abcdef");
+        assert_eq!(fit("abcdef", 4), "…def");
+    }
+
+    #[test]
+    fn pad_fills_to_the_width() {
+        assert_eq!(pad("ab", 5), "ab   ");
+        assert_eq!(pad("abcdef", 3), "abcdef");
     }
 
     #[test]
     fn wrap_breaks_on_words() {
-        let lines = wrap("one two three four five", 12);
-        assert!(lines.iter().all(|line| line.width() <= 10));
-        assert_eq!(lines.concat().replace(' ', ""), "onetwothreefourfive");
-    }
-
-    #[test]
-    fn pad_fills_to_the_requested_width() {
-        assert_eq!(pad("ab", 5), "ab   ");
-        assert_eq!(pad("abcdef", 3), "abcdef");
+        assert_eq!(wrap("one two three", 12), vec!["one two", "three"]);
     }
 }

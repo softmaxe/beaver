@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use beaver::presentation::MatchLevel;
-use beaver::tui::app::{App, Focus, Hit, Tab};
+use beaver::tui::app::{App, Control, Hit, Modal, Step};
 use beaver::tui::ui;
 
 /// Drive the app to a settled state and return what the screen shows.
@@ -30,9 +30,14 @@ impl Harness {
         }
     }
 
-    /// Which matched row holds the caret.
+    /// A harness whose path field starts empty, for typing into.
+    fn empty() -> Self {
+        Self::new(Path::new(""))
+    }
+
+    /// Which proposed rename holds the highlight.
     fn selected(&self) -> Option<usize> {
-        self.app.preview.as_ref().unwrap().matched_state.selected()
+        self.app.preview.as_ref().unwrap().state.selected()
     }
 
     fn press(&mut self, code: KeyCode) {
@@ -42,6 +47,21 @@ impl Harness {
     fn press_control(&mut self, code: KeyCode) {
         self.app
             .handle_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+    }
+
+    /// Type a whole string into whatever holds the keyboard.
+    fn type_text(&mut self, text: &str) {
+        for character in text.chars() {
+            self.press(KeyCode::Char(character));
+        }
+    }
+
+    /// Step 1 to a settled preview, which is where most tests start.
+    fn walk_to_preview(&mut self) {
+        self.press(KeyCode::Enter);
+        assert_eq!(self.app.step, Step::Rules, "{}", self.app.status.text);
+        self.press(KeyCode::Enter);
+        self.settle(|app| !app.scanning && app.preview.is_some());
     }
 
     /// The rectangle the last drawn frame registered for `hit`.
@@ -103,7 +123,7 @@ impl Harness {
         self.terminal.draw(|frame| ui::draw(frame, app)).unwrap();
     }
 
-    /// The bottom row on its own: the hint line, which changes with the focus.
+    /// The bottom row on its own: the status line and the hints beside it.
     fn footer(&self) -> String {
         self.screen().lines().last().unwrap_or_default().to_string()
     }
@@ -192,101 +212,159 @@ fn nested_library() -> tempfile::TempDir {
 
 /// A preview that describes the disk as it is right now.
 fn fresh_preview(app: &App) -> bool {
-    !app.scanning && app.preview.as_ref().is_some_and(|preview| !preview.stale)
+    !app.scanning && app.preview.is_some()
 }
 
 #[test]
-fn previews_ticks_and_applies() {
+fn the_whole_wizard_types_previews_ticks_and_renames() {
     let temporary = library();
-    let mut harness = Harness::new(temporary.path());
+    let mut harness = Harness::empty();
+    harness.type_text(&temporary.path().to_string_lossy());
 
     harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
+    assert_eq!(harness.app.step, Step::Rules);
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+    assert_eq!(harness.app.step, Step::Preview);
 
     let screen = harness.screen();
-    assert!(screen.contains("To rename (2)"), "{screen}");
-    assert!(screen.contains("Skipped (1)"), "{screen}");
-    assert!(screen.contains("episode S01E01"), "{screen}");
     assert!(screen.contains("2 of 2 ticked"), "{screen}");
-    assert!(screen.contains("Preview ready"), "{screen}");
+    assert!(screen.contains("episode S01E01"), "{screen}");
+    assert!(screen.contains("episode S01E02"), "{screen}");
+    // The list trims from the left, so the tails are what is on screen.
+    assert!(
+        screen.contains("Nebula.Archive.S01E01.1080p.ass"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Nebula.Archive.S01E02.1080p.ass"),
+        "{screen}"
+    );
+    assert!(screen.contains("1 skipped"), "{screen}");
     assert!(harness.footer().contains("Preview ready"));
-    // A successful preview hands the keyboard to the results, so the workflow
-    // shortcuts work without pressing anything else first.
-    assert_eq!(harness.app.focus, Focus::Results);
+    assert!(harness.app.is_focused(Control::List));
     assert!(harness.app.can_apply());
 
-    // Untick the highlighted rename; only the other one should be applied.
+    // Untick the highlighted rename; only the other one may be applied.
     harness.press(KeyCode::Char(' '));
     harness.draw();
     assert!(harness.screen().contains("1 of 2 ticked"));
 
     harness.press(KeyCode::Char('a'));
     harness.draw();
-    assert!(harness.screen().contains("Confirm apply"));
+    let screen = harness.screen();
+    assert!(screen.contains("Confirm apply"), "{screen}");
+    assert!(screen.contains("Rename 1 subtitle on disk."), "{screen}");
+
     harness.press(KeyCode::Enter);
-    harness.settle(|app| !app.applying && app.status.text.starts_with("Renamed"));
+    harness.settle(|app| !app.applying && app.outcome.is_some());
+    assert_eq!(harness.app.step, Step::Apply);
+    assert!(harness.app.preview.is_none());
 
     let root = temporary.path();
     assert!(root.join("Nebula.Archive.S01E02.1080p.ass").exists());
     assert!(root
         .join("[Group] Nebula Archive - S01E01.chs.ass")
         .exists());
-    assert!(harness.screen().contains("Renamed 1 file"));
-    // The files moved, so the preview no longer describes the disk.
-    assert!(!harness.app.can_apply());
+    let screen = harness.screen();
+    assert!(screen.contains("Renamed 1 file"), "{screen}");
+    assert!(screen.contains("Start over"), "{screen}");
 }
 
 #[test]
-fn changing_an_option_invalidates_the_preview() {
+fn the_wizard_walks_both_ways() {
+    // An empty path is not a folder, so step one refuses to be left.
+    let mut harness = Harness::empty();
+    harness.press(KeyCode::Enter);
+    harness.draw();
+    assert_eq!(harness.app.step, Step::Folder);
+    assert!(harness.footer().contains("Enter a folder path first"));
+
+    // Nor is a path that points at nothing.
+    let mut harness = Harness::new(Path::new("/no/such/folder/here"));
+    harness.press(KeyCode::Enter);
+    harness.draw();
+    assert_eq!(harness.app.step, Step::Folder);
+    assert!(
+        harness.footer().contains("Not a folder"),
+        "{}",
+        harness.footer()
+    );
+
     let temporary = library();
     let mut harness = Harness::new(temporary.path());
-
     harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-    assert!(harness.app.can_apply());
+    assert_eq!(harness.app.step, Step::Rules);
+    harness.press(KeyCode::Left);
+    assert_eq!(harness.app.step, Step::Folder);
 
-    // Tab round from the results, past the path field, onto the recursive
-    // switch, and flip it.
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.focus, Focus::Directory);
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.focus, Focus::Recursive);
-    harness.press(KeyCode::Char(' '));
+    harness.walk_to_preview();
+    assert_eq!(harness.app.step, Step::Preview);
+    harness.press(KeyCode::Left);
     harness.draw();
-
-    assert!(!harness.app.can_apply());
-    assert!(harness.screen().contains("Options changed — preview again"));
-
-    // Applying anyway is refused rather than acting on a stale plan.
-    harness.press(KeyCode::Char('a'));
-    assert!(harness.app.modal.is_none());
+    assert_eq!(harness.app.step, Step::Rules);
+    assert!(harness.screen().contains("2 · Rules"));
 }
 
 #[test]
-fn a_demo_plan_can_never_be_applied() {
+fn changing_a_rule_drops_the_preview_and_rescans() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+    harness.walk_to_preview();
+    assert!(harness.app.can_apply());
+
+    // Back to the rules, then onto the subfolder switch and flip it.
+    harness.press(KeyCode::Left);
+    harness.press(KeyCode::Tab);
+    assert!(harness.app.is_focused(Control::Recursive));
+    harness.press(KeyCode::Char(' '));
+    harness.draw();
+    assert!(harness.app.recursive);
+    assert!(harness.app.preview.is_none());
+    assert!(harness.screen().contains("[✓] Include subfolders"));
+
+    // The level does the same.
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+    harness.press(KeyCode::Left);
+    assert!(harness.app.is_focused(Control::Level));
+    harness.press(KeyCode::Down);
+    assert_eq!(harness.app.level, MatchLevel::Cautious);
+    assert!(harness.app.preview.is_none());
+
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+    assert_eq!(harness.app.step, Step::Preview);
+    assert!(harness.screen().contains("2 of 2 ticked"));
+}
+
+#[test]
+fn a_demo_writes_nothing_and_can_never_be_applied() {
     let temporary = tempfile::tempdir().unwrap();
     let mut harness = Harness::new(temporary.path());
 
+    // Esc hands the keyboard out of the path field, where letters act.
     harness.press(KeyCode::Esc);
     harness.press(KeyCode::Char('d'));
     harness.draw();
 
-    assert!(harness.screen().contains("Demo mode"));
-    assert!(harness.screen().contains("To rename (3)"));
+    assert_eq!(harness.app.step, Step::Preview);
+    let screen = harness.screen();
+    assert!(screen.contains("demo, nothing is written"), "{screen}");
+    assert!(screen.contains("3 of 3 ticked"), "{screen}");
     assert!(!harness.app.can_apply());
 
     harness.press(KeyCode::Char('a'));
     harness.draw();
     assert!(harness.app.modal.is_none());
-    assert!(harness.screen().contains("Demo mode never writes to disk"));
+    assert!(harness.footer().contains("Demo mode never writes to disk"));
 }
 
 #[test]
-fn bulk_ticking_and_the_skipped_tab() {
+fn bulk_ticking_moves_the_summary_line() {
     let temporary = library();
     let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
+    harness.walk_to_preview();
 
     harness.press_control(KeyCode::Char('r'));
     harness.draw();
@@ -296,26 +374,127 @@ fn bulk_ticking_and_the_skipped_tab() {
     harness.press_control(KeyCode::Char('a'));
     harness.draw();
     assert!(harness.screen().contains("2 of 2 ticked"));
+    assert!(harness.app.can_apply());
+}
 
-    harness.press(KeyCode::Right);
+#[test]
+fn the_skipped_list_opens_and_closes() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+    harness.walk_to_preview();
+
+    harness.press(KeyCode::Char('s'));
     harness.draw();
-    assert_eq!(harness.app.tab, Tab::Skipped);
     let screen = harness.screen();
+    assert!(screen.contains("Skipped (1)"), "{screen}");
     assert!(screen.contains("Unrelated.Bonus.srt"), "{screen}");
     assert!(screen.contains("No matching video"), "{screen}");
+
+    harness.press(KeyCode::Esc);
+    harness.draw();
+    assert!(harness.app.modal.is_none());
+    assert!(!harness.screen().contains("Skipped (1)"));
 }
 
 #[test]
-fn reports_a_directory_that_does_not_exist() {
-    let mut harness = Harness::new(Path::new("/no/such/folder/here"));
+fn the_match_level_decides_whether_a_fuzzy_pair_matches() {
+    let temporary = fuzzy_library();
+    let mut harness = Harness::new(temporary.path());
+    harness.walk_to_preview();
+
+    let screen = harness.screen();
+    assert!(screen.contains("1 of 1 ticked"), "{screen}");
+    assert!(screen.contains("fuzzy 0.76"), "{screen}");
+    assert!(screen.contains("Deep Field Report 2031.srt"), "{screen}");
+
+    // Cautious asks for more than 0.76, so the pair falls out.
+    harness.press(KeyCode::Left);
+    harness.press(KeyCode::Down);
+    assert_eq!(harness.app.level, MatchLevel::Cautious);
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+    let screen = harness.screen();
+    assert!(screen.contains("0 of 0 ticked"), "{screen}");
+    assert!(
+        screen.contains("Nothing matched — press ← and loosen the match level"),
+        "{screen}"
+    );
+    assert!(!harness.app.can_apply());
+
+    // Relaxed takes it back.
+    harness.press(KeyCode::Left);
+    harness.press(KeyCode::Up);
+    harness.press(KeyCode::Up);
+    assert_eq!(harness.app.level, MatchLevel::Relaxed);
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+    assert!(harness.screen().contains("1 of 1 ticked"));
+}
+
+#[test]
+fn including_subfolders_finds_the_subtitles_below_the_root() {
+    let temporary = nested_library();
+    let mut harness = Harness::new(temporary.path());
+    harness.walk_to_preview();
+
+    let screen = harness.screen();
+    assert!(screen.contains("1 of 1 ticked"), "{screen}");
+    assert!(screen.contains("Harbour.S02E01.ass"), "{screen}");
+
+    harness.press(KeyCode::Left);
+    harness.press(KeyCode::Tab);
+    assert!(harness.app.is_focused(Control::Recursive));
+    harness.press(KeyCode::Char(' '));
+    harness.press(KeyCode::Enter);
+    harness.settle(fresh_preview);
+
+    let screen = harness.screen();
+    assert!(screen.contains("2 of 2 ticked"), "{screen}");
+    assert!(screen.contains("Harbour.S03E01.ass"), "{screen}");
+}
+
+#[test]
+fn the_folder_picker_walks_and_fills_the_path_in() {
+    let temporary = picker_library();
+    let mut harness = Harness::new(temporary.path());
+
+    harness.press(KeyCode::Esc);
+    harness.press(KeyCode::Char('o'));
+    harness.draw();
+    let screen = harness.screen();
+    assert!(screen.contains("Browse"), "{screen}");
+    assert!(screen.contains("season 1/"), "{screen}");
+    assert!(screen.contains("season 3/"), "{screen}");
+
+    // Two down and one back up is "season 2", which Enter opens.
+    harness.press(KeyCode::Down);
+    harness.press(KeyCode::Down);
+    harness.press(KeyCode::Up);
     harness.press(KeyCode::Enter);
     harness.draw();
-    assert!(harness.screen().contains("Not a directory"));
-    assert!(harness.app.preview.is_none());
+    let screen = harness.screen();
+    assert!(screen.contains("season 2"), "{screen}");
+    assert!(screen.contains("No subfolders here"), "{screen}");
+
+    harness.press(KeyCode::Char('s'));
+    assert!(harness.app.modal.is_none());
+    assert_eq!(harness.app.step, Step::Folder);
+    assert!(
+        harness.app.directory.value().ends_with("season 2"),
+        "{}",
+        harness.app.directory.value()
+    );
+
+    // The Use this folder button does the same as s.
+    harness.press(KeyCode::Esc);
+    harness.press(KeyCode::Char('o'));
+    harness.click(Hit::PickerUse);
+    assert!(harness.app.modal.is_none());
+    assert!(harness.app.directory.value().ends_with("season 2"));
 }
 
 #[test]
-fn the_help_modal_lists_every_shortcut() {
+fn the_help_modal_lists_the_shortcuts_and_closes() {
     let temporary = tempfile::tempdir().unwrap();
     let mut harness = Harness::new(temporary.path());
     harness.press(KeyCode::Esc);
@@ -324,1135 +503,156 @@ fn the_help_modal_lists_every_shortcut() {
 
     let screen = harness.screen();
     assert!(screen.contains("Keyboard shortcuts"), "{screen}");
-    assert!(screen.contains("Tick or untick"), "{screen}");
+    assert!(screen.contains("Tick everything / nothing"), "{screen}");
+    assert!(
+        screen.contains("Back and forward through the four steps"),
+        "{screen}"
+    );
 
     harness.press(KeyCode::Esc);
     harness.draw();
+    assert!(harness.app.modal.is_none());
     assert!(!harness.screen().contains("Keyboard shortcuts"));
 }
 
 #[test]
-fn the_layout_survives_a_small_terminal() {
+fn the_mouse_selects_ticks_toggles_and_steps_back() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+    harness.walk_to_preview();
+
+    // The first click moves the highlight without touching any tick.
+    harness.click(Hit::Row(1));
+    assert!(harness.app.is_focused(Control::List));
+    assert_eq!(harness.selected(), Some(1));
+    assert!(harness.app.preview.as_ref().unwrap().ticked[1]);
+
+    // The second click on the same row unticks it.
+    harness.click(Hit::Row(1));
+    harness.draw();
+    assert!(!harness.app.preview.as_ref().unwrap().ticked[1]);
+    assert!(harness.screen().contains("1 of 2 ticked"));
+
+    // Hovering a button changes nothing and panics at nothing.
+    harness.hover(Hit::Control(Control::Advance));
+    harness.draw();
+    assert_eq!(harness.selected(), Some(1));
+
+    // The wheel moves the highlight in the list underneath the pointer.
+    harness.wheel(MouseEventKind::ScrollUp);
+    assert_eq!(harness.selected(), Some(0));
+
+    // A dot behind the current step walks back to it.
+    harness.click(Hit::Dot(0));
+    assert_eq!(harness.app.step, Step::Folder);
+
+    // The subfolder switch flips under the pointer.
+    harness.press(KeyCode::Enter);
+    assert_eq!(harness.app.step, Step::Rules);
+    harness.click(Hit::Control(Control::Recursive));
+    harness.draw();
+    assert!(harness.app.recursive);
+    assert!(harness.screen().contains("[✓] Include subfolders"));
+    harness.click(Hit::Control(Control::Recursive));
+    harness.draw();
+    assert!(!harness.app.recursive);
+    assert!(harness.screen().contains("[ ] Include subfolders"));
+}
+
+#[test]
+fn the_step_bar_names_all_four_steps() {
+    let temporary = library();
+    let mut harness = Harness::new(temporary.path());
+    harness.draw();
+    let screen = harness.screen();
+    for label in ["Folder", "Rules", "Preview", "Apply"] {
+        assert!(screen.contains(label), "{label} missing from {screen}");
+    }
+    assert!(screen.contains("1 · Folder"), "{screen}");
+}
+
+#[test]
+fn every_step_still_renders_in_an_eighty_by_twenty_four_terminal() {
     let temporary = library();
     let mut harness = Harness::new(temporary.path());
     harness.terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    let screen = harness.screen();
-    assert!(screen.contains("To rename (2)"), "{screen}");
-    assert!(screen.contains("space tick"), "{screen}");
-    for action in ["p preview", "a apply", "d demo"] {
-        assert!(harness.footer().contains(action), "{screen}");
-    }
-    // Stacked, not side by side: the setup column keeps the full width.
-    assert!(
-        screen
-            .lines()
-            .any(|line| line.contains("Include subfolders")),
-        "{screen}"
-    );
-}
-
-#[test]
-fn quits_on_q_and_on_control_c() {
-    let temporary = tempfile::tempdir().unwrap();
-
-    let mut harness = Harness::new(temporary.path());
-    // The path field has focus, so a bare letter types rather than quitting.
-    harness.press(KeyCode::Char('q'));
-    assert!(!harness.app.should_quit);
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Char('q'));
-    assert!(harness.app.should_quit);
-
-    // Control+C always quits, whatever holds the keyboard.
-    let mut harness = Harness::new(temporary.path());
-    harness.press_control(KeyCode::Char('c'));
-    assert!(harness.app.should_quit);
-}
-
-#[test]
-fn quit_keys_wait_for_an_apply_to_finish() {
-    let temporary = tempfile::tempdir().unwrap();
-
-    let mut harness = Harness::new(temporary.path());
-    harness.app.applying = true;
-    harness.app.focus = Focus::Results;
-    harness.press(KeyCode::Char('q'));
-    assert!(!harness.app.should_quit);
-    assert_eq!(
-        harness.app.status.text,
-        "Applying… wait for it to finish before quitting"
-    );
-
-    let mut harness = Harness::new(temporary.path());
-    harness.app.applying = true;
-    harness.press_control(KeyCode::Char('c'));
-    assert!(!harness.app.should_quit);
-    assert_eq!(
-        harness.app.status.text,
-        "Applying… wait for it to finish before quitting"
-    );
-}
-
-#[test]
-fn tab_cycles_the_controls_and_esc_jumps_between_the_ends() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    for expected in [
-        Focus::Recursive,
-        Focus::Strict,
-        Focus::Level,
-        Focus::Results,
-        Focus::Directory,
-    ] {
-        harness.press(KeyCode::Tab);
-        assert_eq!(harness.app.focus, expected);
-    }
-    for expected in [
-        Focus::Results,
-        Focus::Level,
-        Focus::Strict,
-        Focus::Recursive,
-        Focus::Directory,
-    ] {
-        harness.press(KeyCode::BackTab);
-        assert_eq!(harness.app.focus, expected);
-    }
-
-    // Up and down step between the setup controls as well.
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Down);
-    assert_eq!(harness.app.focus, Focus::Strict);
-    harness.press(KeyCode::Up);
-    assert_eq!(harness.app.focus, Focus::Recursive);
-
-    // Esc is the shortcut out of the path field, and back to it.
-    harness.app.focus = Focus::Directory;
-    harness.press(KeyCode::Esc);
-    assert_eq!(harness.app.focus, Focus::Results);
-    harness.press(KeyCode::Esc);
-    assert_eq!(harness.app.focus, Focus::Directory);
-}
-
-#[test]
-fn letters_type_into_the_path_field_until_the_focus_leaves_it() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    // Every one of these is a shortcut elsewhere, and none of them may fire here.
-    for character in ['p', 'a', 'd', 'o', '?'] {
-        harness.press(KeyCode::Char(character));
-    }
-    assert!(harness.app.directory.value().ends_with("pado?"));
-    assert!(harness.app.modal.is_none());
-    assert!(harness.app.preview.is_none());
-
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Char('d'));
-    harness.draw();
-    assert!(harness.screen().contains("Demo mode"));
-
-    harness.press(KeyCode::Char('?'));
-    harness.draw();
-    assert!(harness.screen().contains("Keyboard shortcuts"));
-}
-
-#[test]
-fn the_path_can_be_edited_in_place_and_previewed_with_enter() {
-    let temporary = library();
-    let path = temporary.path().to_string_lossy().into_owned();
-    let mut harness = Harness::new(temporary.path());
-
-    // The cursor starts at the end, so backspace trims the path.
-    harness.press(KeyCode::Backspace);
-    harness.press(KeyCode::Enter);
-    harness.draw();
-    assert!(harness.screen().contains("Not a directory"));
-    assert!(harness.app.preview.is_none());
-
-    harness.press(KeyCode::Char(path.chars().last().unwrap()));
-    assert_eq!(harness.app.directory.value(), path);
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-    assert!(harness.screen().contains("To rename (2)"));
-
-    // An empty field asks for a path rather than scanning anything.
-    let mut harness = Harness::new(Path::new(""));
-    harness.press(KeyCode::Enter);
-    harness.draw();
-    assert!(harness.screen().contains("Enter a directory path first"));
-    assert!(harness.app.preview.is_none());
-}
-
-#[test]
-fn arrows_set_the_switches_and_step_through_the_match_levels() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Right);
-    harness.draw();
-    assert!(harness.app.recursive);
-    assert!(harness.screen().contains("[✓] Include subfolders"));
-    harness.press(KeyCode::Left);
-    harness.draw();
-    assert!(!harness.app.recursive);
-    assert!(harness.screen().contains("[ ] Include subfolders"));
-
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Right);
-    harness.draw();
-    assert!(harness.app.strict);
-    assert!(harness.screen().contains("[✓] Strict mode"));
-
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Down);
     harness.draw();
     let screen = harness.screen();
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    assert!(screen.contains("(●) Cautious"), "{screen}");
-    assert!(screen.contains("Only near-certain matches"), "{screen}");
+    assert!(screen.contains("1 · Folder"), "{screen}");
+    assert!(screen.contains("Next →"), "{screen}");
 
-    harness.press(KeyCode::Up);
-    harness.press(KeyCode::Up);
-    harness.draw();
-    let screen = harness.screen();
-    assert_eq!(harness.app.level, MatchLevel::Relaxed);
-    assert!(screen.contains("(●) Relaxed"), "{screen}");
-    assert!(
-        screen.contains("Matches more, for messy naming"),
-        "{screen}"
-    );
-
-    // Space cycles to the next level rather than stopping at the end.
-    harness.press(KeyCode::Char(' '));
-    assert_eq!(harness.app.level, MatchLevel::Balanced);
-}
-
-#[test]
-fn arrows_move_the_highlight_and_space_ticks_the_highlighted_row() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
     harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    assert_eq!(harness.selected(), Some(0));
-
-    harness.press(KeyCode::Down);
     harness.draw();
-    assert_eq!(harness.selected(), Some(1));
-    // The detail line spells the highlighted rename out in full.
     let screen = harness.screen();
-    assert!(
-        screen.contains(
-            "[Group] Nebula Archive - S01E02.chs.ass  →  Nebula.Archive.S01E02.1080p.ass"
-        ),
-        "{screen}"
-    );
+    assert!(screen.contains("2 · Rules"), "{screen}");
+    assert!(screen.contains("Preview →"), "{screen}");
+    assert!(screen.contains("Include subfolders"), "{screen}");
 
-    // The highlight stops at the last row instead of running off the list.
-    harness.press(KeyCode::Down);
-    assert_eq!(harness.selected(), Some(1));
-    harness.press(KeyCode::Home);
-    assert_eq!(harness.selected(), Some(0));
-    harness.press(KeyCode::End);
-    assert_eq!(harness.selected(), Some(1));
-
-    harness.press(KeyCode::Char(' '));
-    harness.draw();
-    assert_eq!(harness.app.preview.as_ref().unwrap().ticked, [true, false]);
-    assert!(harness.screen().contains("1 of 2 ticked"));
-}
-
-#[test]
-fn a_cautious_level_matches_less_than_the_default_one() {
-    let temporary = fuzzy_library();
-    let mut harness = Harness::new(temporary.path());
     harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    let screen = harness.screen();
-    assert!(screen.contains("To rename (1)"), "{screen}");
-    assert!(
-        screen.contains("Deep Feild Raport.srt → Deep Field Report 2031.srt"),
-        "{screen}"
-    );
-    assert!(screen.contains("fuzzy 0.76"), "{screen}");
-
-    // Back one control to the levels, tighten it, and preview again.
-    harness.press(KeyCode::BackTab);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.press(KeyCode::Down);
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    harness.press(KeyCode::Char('p'));
     harness.settle(fresh_preview);
-
     let screen = harness.screen();
-    assert!(screen.contains("To rename (0)"), "{screen}");
-    assert!(screen.contains("Nothing to rename"), "{screen}");
-    assert!(!harness.app.can_apply());
-
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Right);
-    harness.draw();
-    let screen = harness.screen();
-    assert!(screen.contains("No matching video (best 0.76)"), "{screen}");
-}
-
-#[test]
-fn including_subfolders_finds_the_subtitles_below_the_root() {
-    let temporary = nested_library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    let screen = harness.screen();
-    assert!(screen.contains("To rename (1)"), "{screen}");
-    assert!(screen.contains("1 folder"), "{screen}");
-    assert!(!screen.contains("season 3/"), "{screen}");
-
-    // Turn the subfolder switch on and preview again with p.
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.focus, Focus::Recursive);
-    harness.press(KeyCode::Right);
-    harness.press(KeyCode::Char('p'));
-    harness.settle(fresh_preview);
-
-    let screen = harness.screen();
-    assert!(screen.contains("To rename (2)"), "{screen}");
-    assert!(screen.contains("2 folders"), "{screen}");
-    assert!(
-        screen.contains("season 3/[G] Harbour - S03E01.ass → Harbour.S03E01.ass"),
-        "{screen}"
-    );
-}
-
-#[test]
-fn applying_with_nothing_ticked_is_refused() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    harness.press_control(KeyCode::Char('r'));
-    harness.press(KeyCode::Char('a'));
-    harness.draw();
-
-    assert!(harness.app.modal.is_none());
-    assert!(harness.screen().contains("Tick at least one subtitle"));
-    assert!(temporary
-        .path()
-        .join("[Group] Nebula Archive - S01E01.chs.ass")
-        .exists());
-}
-
-#[test]
-fn cancelling_the_confirmation_writes_nothing() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    harness.press(KeyCode::Char('a'));
-    harness.draw();
-    let screen = harness.screen();
-    assert!(
-        screen.contains("About to rename 2 subtitle files."),
-        "{screen}"
-    );
-    assert!(
-        screen.contains("Existing files are never overwritten."),
-        "{screen}"
-    );
-
-    // q closes the dialog; it does not quit the app behind it.
-    harness.press(KeyCode::Char('q'));
-    harness.draw();
-    assert!(harness.app.modal.is_none());
-    assert!(!harness.app.should_quit);
-    assert!(harness.app.can_apply());
-    assert!(temporary
-        .path()
-        .join("[Group] Nebula Archive - S01E01.chs.ass")
-        .exists());
-    assert!(!temporary
-        .path()
-        .join("Nebula.Archive.S01E01.1080p.ass")
-        .exists());
-}
-
-#[test]
-fn previewing_again_after_an_apply_finds_nothing_left_to_do() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
+    assert!(screen.contains("3 · Preview"), "{screen}");
+    // Not bare "Apply": the step bar carries that word on every step.
+    assert!(screen.contains("Apply (a)"), "{screen}");
+    assert!(screen.contains("2 of 2 ticked"), "{screen}");
 
     harness.press(KeyCode::Char('a'));
     harness.press(KeyCode::Enter);
-    harness.settle(|app| !app.applying && app.status.text.starts_with("Renamed"));
-    assert!(harness.screen().contains("Renamed 2 files"));
-
-    harness.press(KeyCode::Char('p'));
-    harness.settle(fresh_preview);
-
+    harness.settle(|app| !app.applying && app.outcome.is_some());
     let screen = harness.screen();
-    assert!(screen.contains("To rename (0)"), "{screen}");
-    assert!(screen.contains("Skipped (3)"), "{screen}");
-    assert!(screen.contains("Nothing to rename"), "{screen}");
-    assert!(!harness.app.can_apply());
+    assert!(screen.contains("4 · Apply"), "{screen}");
+    assert!(screen.contains("Start over"), "{screen}");
+    assert!(screen.contains("Renamed 2 files"), "{screen}");
 }
 
 #[test]
-fn previewing_a_folder_with_nothing_in_it() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    let screen = harness.screen();
-    assert!(screen.contains("To rename (0)"), "{screen}");
-    assert!(screen.contains("Nothing to rename"), "{screen}");
-    assert!(
-        screen.contains("No video files in this directory"),
-        "{screen}"
-    );
-    // Nothing was matched, so the keyboard stays where the path is typed.
-    assert_eq!(harness.app.focus, Focus::Directory);
-    assert!(!harness.app.can_apply());
-
-    fs::write(temporary.path().join("Harbour.S01E01.mkv"), b"video").unwrap();
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.status.text.starts_with("No subtitle"));
-    assert!(harness
-        .screen()
-        .contains("No subtitle files in this directory"));
-}
-
-#[test]
-fn a_folder_that_is_already_tidy_reports_every_subtitle_as_skipped() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path();
-    fs::write(root.join("Harbour.S01E01.mkv"), b"video").unwrap();
-    fs::write(root.join("Harbour.S01E01.srt"), b"subtitle").unwrap();
-
-    let mut harness = Harness::new(root);
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-    assert!(harness.screen().contains("To rename (0)"));
-
-    // With nothing to rename the path field keeps the keyboard, so reaching the
-    // skipped tab takes an esc first.
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Right);
-    harness.draw();
-    assert_eq!(harness.app.tab, Tab::Skipped);
-    let screen = harness.screen();
-    assert!(screen.contains("Harbour.S01E01.srt"), "{screen}");
-    assert!(screen.contains("Filename already matches"), "{screen}");
-}
-
-#[test]
-fn the_directory_picker_chooses_a_subfolder() {
-    let temporary = nested_library();
-    let mut harness = Harness::new(temporary.path());
-    let typed = harness.app.directory.value();
-
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Char('o'));
-    harness.draw();
-    let screen = harness.screen();
-    assert!(screen.contains("Choose a directory"), "{screen}");
-    assert!(screen.contains("season 3"), "{screen}");
-
-    // Esc backs out without touching the path.
-    harness.press(KeyCode::Esc);
-    harness.draw();
-    assert!(harness.app.modal.is_none());
-    assert_eq!(harness.app.directory.value(), typed);
-
-    harness.press(KeyCode::Char('o'));
-    harness.press(KeyCode::Enter);
-    harness.press(KeyCode::Char('s'));
-    assert!(harness.app.modal.is_none());
-    assert_eq!(harness.app.focus, Focus::Directory);
-    assert!(harness.app.directory.value().ends_with("season 3"));
-
-    // The chosen folder is scanned on its own.
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-    let screen = harness.screen();
-    assert!(screen.contains("To rename (1)"), "{screen}");
-    assert!(
-        screen.contains("[G] Harbour - S03E01.ass → Harbour.S03E01.ass"),
-        "{screen}"
-    );
-}
-
-#[test]
-fn vim_letters_stand_in_for_the_arrows_over_the_setup_controls() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    // h and l set a switch the way ← and → do, rather than toggling it.
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Char('l'));
-    harness.draw();
-    assert!(harness.app.recursive);
-    assert!(harness.screen().contains("[✓] Include subfolders"));
-    harness.press(KeyCode::Char('h'));
-    harness.draw();
-    assert!(!harness.app.recursive);
-    assert!(harness.screen().contains("[ ] Include subfolders"));
-
-    // j and k step between the controls, exactly as down and up do.
-    harness.press(KeyCode::Char('j'));
-    assert_eq!(harness.app.focus, Focus::Strict);
-    harness.press(KeyCode::Char('k'));
-    assert_eq!(harness.app.focus, Focus::Recursive);
-
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.press(KeyCode::Char('j'));
-    harness.draw();
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    assert!(harness.screen().contains("(●) Cautious"));
-    harness.press(KeyCode::Char('k'));
-    assert_eq!(harness.app.level, MatchLevel::Balanced);
-
-    // g and G are home and end: the ends of the group, not the ends of the form.
-    harness.press(KeyCode::Char('g'));
-    harness.draw();
-    assert_eq!(harness.app.level, MatchLevel::Relaxed);
-    assert!(harness.screen().contains("(●) Relaxed"));
-    harness.press(KeyCode::Char('G'));
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    assert_eq!(harness.app.focus, Focus::Level);
-}
-
-#[test]
-fn vim_letters_move_the_highlight_and_switch_tabs_in_the_results() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    assert_eq!(harness.app.focus, Focus::Results);
-
-    harness.press(KeyCode::Char('j'));
-    harness.draw();
-    assert_eq!(harness.selected(), Some(1));
-    assert!(harness
-        .screen()
-        .contains("[Group] Nebula Archive - S01E02.chs.ass  →  Nebula.Archive.S01E02.1080p.ass"));
-    harness.press(KeyCode::Char('k'));
-    assert_eq!(harness.selected(), Some(0));
-    harness.press(KeyCode::Char('G'));
-    assert_eq!(harness.selected(), Some(1));
-    harness.press(KeyCode::Char('g'));
-    assert_eq!(harness.selected(), Some(0));
-
-    // h and l are the tab keys here, the same as ← and →.
-    harness.press(KeyCode::Char('l'));
-    harness.draw();
-    assert_eq!(harness.app.tab, Tab::Skipped);
-    assert!(harness.screen().contains("Unrelated.Bonus.srt"));
-    harness.press(KeyCode::Char('h'));
-    harness.draw();
-    assert_eq!(harness.app.tab, Tab::Matched);
-    assert!(harness.screen().contains("2 of 2 ticked"));
-}
-
-#[test]
-fn the_page_keys_jump_by_half_a_screen_and_a_whole_one_and_stop_at_the_ends() {
+fn the_jump_keys_keep_the_highlight_inside_a_long_list() {
     let temporary = long_library();
     let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
+    harness.walk_to_preview();
 
-    assert!(harness.screen().contains("To rename (14)"));
+    assert!(harness.screen().contains("14 of 14 ticked"));
+    assert_eq!(harness.selected(), Some(0));
+
+    harness.press(KeyCode::Char('G'));
+    assert_eq!(harness.selected(), Some(13));
+    harness.press(KeyCode::Char('G'));
+    assert_eq!(harness.selected(), Some(13));
+    harness.press(KeyCode::Char('g'));
     assert_eq!(harness.selected(), Some(0));
 
     harness.press_control(KeyCode::Char('d'));
-    harness.draw();
     assert_eq!(harness.selected(), Some(5));
-    // Half a page is five rows, and the detail line proves which row that is.
-    assert!(harness
-        .screen()
-        .contains("[G] Harbour - S01E06.chs.ass  →  Harbour.S01E06.ass"));
-
+    harness.press_control(KeyCode::Char('u'));
+    assert_eq!(harness.selected(), Some(0));
     harness.press_control(KeyCode::Char('u'));
     assert_eq!(harness.selected(), Some(0));
 
-    harness.press_control(KeyCode::Char('f'));
-    harness.draw();
+    harness.press(KeyCode::PageDown);
     assert_eq!(harness.selected(), Some(10));
-    assert!(harness
-        .screen()
-        .contains("[G] Harbour - S01E11.chs.ass  →  Harbour.S01E11.ass"));
-
-    harness.press_control(KeyCode::Char('b'));
+    harness.press(KeyCode::PageDown);
+    assert_eq!(harness.selected(), Some(13));
+    harness.press(KeyCode::PageUp);
+    assert_eq!(harness.selected(), Some(3));
+    harness.press(KeyCode::PageUp);
     assert_eq!(harness.selected(), Some(0));
 
-    // Both directions stop at the end of the list instead of running off it.
-    harness.press_control(KeyCode::Char('b'));
-    assert_eq!(harness.selected(), Some(0));
-    harness.press_control(KeyCode::Char('f'));
-    harness.press_control(KeyCode::Char('f'));
-    assert_eq!(harness.selected(), Some(13));
-    harness.press_control(KeyCode::Char('d'));
-    assert_eq!(harness.selected(), Some(13));
+    harness.draw();
+    assert!(harness.screen().contains("Harbour.S01E01.ass"));
 }
 
 #[test]
-fn the_match_levels_hand_the_keyboard_on_at_either_end() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-    harness.app.focus = Focus::Level;
-
-    // Off the top of the group is the control above it, not a dead key: three
-    // radios that up and down cannot leave would trap the keyboard.
-    harness.press(KeyCode::Up);
-    assert_eq!(harness.app.level, MatchLevel::Relaxed);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.press(KeyCode::Up);
-    assert_eq!(harness.app.focus, Focus::Strict);
-    assert_eq!(harness.app.level, MatchLevel::Relaxed);
-
-    harness.app.focus = Focus::Level;
-    harness.press(KeyCode::Down);
-    harness.press(KeyCode::Down);
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.press(KeyCode::Down);
-    assert_eq!(harness.app.focus, Focus::Results);
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-}
-
-#[test]
-fn sideways_and_jump_keys_stay_inside_the_match_levels() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-    harness.app.focus = Focus::Level;
-
-    // Left at the top of the group holds still: sideways sets the value, so it
-    // must never be the key that loses the group.
-    harness.press(KeyCode::Left);
-    harness.press(KeyCode::Left);
-    harness.draw();
-    assert_eq!(harness.app.level, MatchLevel::Relaxed);
-    assert_eq!(harness.app.focus, Focus::Level);
-    assert!(harness.screen().contains("(●) Relaxed"));
-
-    harness.press(KeyCode::Right);
-    harness.press(KeyCode::Right);
-    harness.press(KeyCode::Right);
-    harness.draw();
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    assert_eq!(harness.app.focus, Focus::Level);
-    assert!(harness.screen().contains("(●) Cautious"));
-
-    // A jump lands on the first or last level rather than stepping out.
-    harness.press(KeyCode::Home);
-    assert_eq!(harness.app.level, MatchLevel::Relaxed);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.press(KeyCode::End);
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.press(KeyCode::Char('g'));
-    assert_eq!(harness.app.level, MatchLevel::Relaxed);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.press(KeyCode::Char('G'));
-    assert_eq!(harness.app.level, MatchLevel::Cautious);
-    assert_eq!(harness.app.focus, Focus::Level);
-}
-
-#[test]
-fn up_and_down_leave_the_path_field_and_i_comes_back_to_it() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    // The field is the first row of the form, so down is the next control and up
-    // wraps round to the far end rather than doing nothing.
-    harness.press(KeyCode::Down);
-    assert_eq!(harness.app.focus, Focus::Recursive);
-    harness.press(KeyCode::Up);
-    assert_eq!(harness.app.focus, Focus::Directory);
-    harness.press(KeyCode::Up);
-    assert_eq!(harness.app.focus, Focus::Results);
-
-    // Nothing was typed on the way: those keys navigated, they did not edit.
-    assert_eq!(
-        harness.app.directory.value(),
-        temporary.path().to_string_lossy()
-    );
-
-    harness.press(KeyCode::Char('i'));
-    assert_eq!(harness.app.focus, Focus::Directory);
-    harness.press(KeyCode::Char('i'));
-    assert!(harness.app.directory.value().ends_with('i'));
-}
-
-#[test]
-fn the_path_field_answers_to_the_shell_editing_keys() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    // The cursor is not on screen anywhere, so where it sits is shown by where
-    // the next typed character lands.
-    harness.app.directory.set_value("/tmp/shows");
-    harness.press_control(KeyCode::Char('a'));
-    harness.press(KeyCode::Char('~'));
-    assert_eq!(harness.app.directory.value(), "~/tmp/shows");
-    harness.press_control(KeyCode::Char('e'));
-    harness.press(KeyCode::Char('!'));
-    assert_eq!(harness.app.directory.value(), "~/tmp/shows!");
-
-    // Control+K drops the tail from wherever the cursor is.
-    harness.app.directory.set_value("/tmp/shows/season");
-    for _ in 0..6 {
-        harness.press(KeyCode::Left);
-    }
-    harness.press_control(KeyCode::Char('k'));
-    assert_eq!(harness.app.directory.value(), "/tmp/shows/");
-
-    // Control+W takes a whole path segment, not a word.
-    harness.app.directory.set_value("/tmp/shows/season one/");
-    harness.press_control(KeyCode::Char('w'));
-    assert_eq!(harness.app.directory.value(), "/tmp/shows/");
-
-    harness.press_control(KeyCode::Char('u'));
-    assert!(harness.app.directory.is_empty());
-    harness.press(KeyCode::Enter);
-    harness.draw();
-    assert!(harness.screen().contains("Enter a directory path first"));
-}
-
-#[test]
-fn a_control_held_letter_never_types_itself_into_the_path() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-    harness.app.directory.set_value("/tmp/shows");
-
-    // These are commands elsewhere in the interface; in the field they are simply
-    // not text, and a path that quietly grows an "x" is a path that will not scan.
-    for character in ['x', 'p', 'o', 'z', 'g'] {
-        harness.press_control(KeyCode::Char(character));
-    }
-    assert_eq!(harness.app.directory.value(), "/tmp/shows");
-    assert!(harness.app.modal.is_none());
-    assert!(harness.app.preview.is_none());
-    assert_eq!(harness.app.focus, Focus::Directory);
-}
-
-#[test]
-fn space_says_why_nothing_was_ticked_instead_of_going_quiet() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(|app| app.preview.is_some());
-
-    // Skipped rows have no checkbox, and a key that does nothing reads as broken.
-    harness.press(KeyCode::Right);
-    harness.press(KeyCode::Char(' '));
-    harness.draw();
-    let screen = harness.screen();
-    assert!(
-        screen.contains("Skipped files are not renamed — press ← for the renames"),
-        "{screen}"
-    );
-    assert_eq!(harness.app.preview.as_ref().unwrap().ticked, [true, true]);
-
-    // The same before there is anything to tick at all, with the way out spelt out.
-    let empty = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(empty.path());
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Char(' '));
-    harness.draw();
-    let screen = harness.screen();
-    assert!(
-        screen.contains("Nothing to tick yet — p to preview, d for a demo"),
-        "{screen}"
-    );
-}
-
-#[test]
-fn the_footer_names_the_keys_that_the_focused_control_answers_to() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    harness.draw();
-    assert!(harness.footer().contains("enter preview"));
-
-    harness.press(KeyCode::Tab);
-    harness.draw();
-    let footer = harness.footer();
-    assert!(footer.contains("space toggle"), "{footer}");
-    assert!(!footer.contains("space tick"), "{footer}");
-
-    harness.press(KeyCode::Tab);
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.focus, Focus::Level);
-    harness.draw();
-    let footer = harness.footer();
-    assert!(footer.contains("↑↓ choose"), "{footer}");
-    assert!(!footer.contains("space toggle"), "{footer}");
-
-    harness.press(KeyCode::Tab);
-    harness.draw();
-    let footer = harness.footer();
-    assert!(footer.contains("space tick"), "{footer}");
-    assert!(footer.contains("←→ tabs"), "{footer}");
-
-    // The verbs are not repeated here: each one is a button with its own key
-    // printed on it, and the two chords sit on the results border.
-    for repeated in ["p preview", "a apply", "d demo", "^a all", "^r none"] {
-        assert!(!footer.contains(repeated), "{repeated} in {footer}");
-    }
-    assert!(harness.screen().contains("Demo mode (d)"));
-}
-
-#[test]
-fn the_footer_drops_its_least_important_hints_before_help_and_quit() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-    harness.terminal = Terminal::new(TestBackend::new(30, 24)).unwrap();
-    harness.press(KeyCode::Esc);
-    assert_eq!(harness.app.focus, Focus::Results);
-    harness.draw();
-
-    // The line has to give somewhere: the tail goes first and the two escape
-    // hatches always stay.
-    let footer = harness.footer();
-    assert!(footer.contains("? help"), "{footer}");
-    assert!(footer.contains("q quit"), "{footer}");
-    assert!(!footer.contains("←→ tabs"), "{footer}");
-}
-
-#[test]
-fn the_directory_picker_takes_the_vim_keys_and_space() {
-    let temporary = picker_library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Char('o'));
-    harness.draw();
-    assert!(harness.screen().contains("Choose a directory"));
-
-    // The highlight is a colour, so where it sits only shows in what l opens.
-    // j and k walk the listing: two down and one back up is "season 2".
-    harness.press(KeyCode::Char('j'));
-    harness.press(KeyCode::Char('j'));
-    harness.press(KeyCode::Char('k'));
-    harness.press(KeyCode::Char('l'));
-    harness.draw();
-    let screen = harness.screen();
-    assert!(screen.contains("season 2"), "{screen}");
-    assert!(screen.contains("No subfolders here"), "{screen}");
-
-    // h comes back up, the same as ←, and g goes to the top of the listing.
-    harness.press(KeyCode::Char('h'));
-    harness.press(KeyCode::Char('g'));
-    harness.press(KeyCode::Char('l'));
-    harness.draw();
-    let screen = harness.screen();
-    assert!(screen.contains("extras"), "{screen}");
-
-    // G goes to the bottom of it.
-    harness.press(KeyCode::Char('h'));
-    harness.press(KeyCode::Char('G'));
-    harness.press(KeyCode::Char('l'));
-
-    // Space takes the open folder, just as s does.
-    harness.press(KeyCode::Char(' '));
-    assert!(harness.app.modal.is_none());
-    assert_eq!(harness.app.focus, Focus::Directory);
-    assert!(
-        harness.app.directory.value().ends_with("season 3"),
-        "{}",
-        harness.app.directory.value()
-    );
-}
-
-#[test]
-fn clicking_a_row_selects_it_and_clicking_again_ticks_it() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-
-    harness.press(KeyCode::Enter);
-    harness.settle(fresh_preview);
-    assert!(harness.screen().contains("2 of 2 ticked"));
-
-    // The first click moves the selection without touching any tick.
-    harness.click(Hit::MatchedRow(1));
-    assert_eq!(harness.app.focus, Focus::Results);
-    {
-        let preview = harness.app.preview.as_ref().unwrap();
-        assert_eq!(preview.matched_state.selected(), Some(1));
-        assert!(preview.ticked[1]);
-    }
-
-    // The second click, on the row you are already on, unticks it.
-    harness.click(Hit::MatchedRow(1));
-    assert!(!harness.app.preview.as_ref().unwrap().ticked[1]);
-    harness.draw();
-    assert!(harness.screen().contains("1 of 2 ticked"));
-}
-
-#[test]
-fn hovering_tints_a_row_without_moving_the_keyboard() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-
-    harness.press(KeyCode::Enter);
-    harness.settle(fresh_preview);
-
-    harness.hover(Hit::MatchedRow(1));
-    harness.draw();
-    // The tint is the palette's own selection background, and the pointer
-    // changes nothing about focus or which row is selected.
-    let rect = harness.rect_for(Hit::MatchedRow(1));
-    let buffer = harness.terminal.backend().buffer();
-    assert_eq!(
-        buffer[(rect.x + 2, rect.y)].bg,
-        ratatui::style::Color::Rgb(0x31, 0x32, 0x44)
-    );
-    assert_eq!(
-        harness.app.preview.unwrap().matched_state.selected(),
-        Some(0)
-    );
-}
-
-#[test]
-fn clicking_the_controls_toggles_previews_and_switches_tabs() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-
-    harness.press(KeyCode::Enter);
-    harness.settle(fresh_preview);
-
-    // The recursive switch flips, takes the keyboard, and stales the preview.
-    harness.click(Hit::Recursive);
-    assert!(harness.app.recursive);
-    assert_eq!(harness.app.focus, Focus::Recursive);
-    assert!(!harness.app.can_apply());
-    harness.draw();
-    assert!(harness.screen().contains("Options changed — preview again"));
-
-    // The disabled apply button rests on the selection background, so under
-    // the pointer it steps up to the hover surface instead.
-    harness.hover(Hit::ApplyButton);
-    harness.draw();
-    let rect = harness.rect_for(Hit::ApplyButton);
-    let buffer = harness.terminal.backend().buffer();
-    assert_eq!(
-        buffer[(rect.x + 2, rect.y)].bg,
-        ratatui::style::Color::Rgb(0x45, 0x47, 0x5a)
-    );
-
-    // The preview button does what p does.
-    harness.click(Hit::PreviewButton);
-    harness.settle(fresh_preview);
-    assert!(harness.app.can_apply());
-
-    // A tab chip switches panes.
-    harness.click(Hit::Tab(Tab::Skipped));
-    assert_eq!(harness.app.tab, Tab::Skipped);
-    assert_eq!(harness.app.focus, Focus::Results);
-    harness.draw();
-    assert!(harness.screen().contains("Unrelated.Bonus.srt"));
-
-    // The browse button under the path field opens the picker, the same as o.
-    harness.click(Hit::BrowseButton);
-    assert!(matches!(
-        harness.app.modal,
-        Some(beaver::tui::app::Modal::Picker(_))
-    ));
-}
-
-#[test]
-fn clicking_the_picker_selects_then_descends() {
-    let temporary = picker_library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Char('o'));
-
-    // The listing opens with the first folder already highlighted, so a single
-    // click descends into it.
-    harness.click(Hit::PickerRow(0));
-    {
-        let Some(beaver::tui::app::Modal::Picker(picker)) = harness.app.modal.as_ref() else {
-            panic!("picker closed");
-        };
-        assert!(
-            picker.current.ends_with("season 1"),
-            "{}",
-            picker.current.display()
-        );
-    }
-
-    // Back up to the root, where the highlight starts on the wrong folder:
-    // the first click selects, the second descends.
-    harness.press(KeyCode::Char('h'));
-    harness.click(Hit::PickerRow(2));
-    let Some(beaver::tui::app::Modal::Picker(picker)) = harness.app.modal.as_ref() else {
-        panic!("picker closed");
-    };
-    assert_eq!(picker.state.selected(), Some(2));
-    assert!(picker
-        .current
-        .ends_with(temporary.path().file_name().unwrap()));
-
-    harness.click(Hit::PickerRow(2));
-    let Some(beaver::tui::app::Modal::Picker(picker)) = harness.app.modal.as_ref() else {
-        panic!("picker closed");
-    };
-    assert!(
-        picker.current.ends_with("season 3"),
-        "{}",
-        picker.current.display()
-    );
-}
-
-/// Every step of the workflow has to be reachable without touching a key: the
-/// picker's own buttons, the confirmation, the bulk ticks, help and quit.
-#[test]
-fn the_whole_workflow_can_be_driven_by_the_mouse_alone() {
+fn a_modal_is_reachable_and_dismissable_by_the_mouse() {
     let temporary = library();
     let mut harness = Harness::new(temporary.path());
     harness.draw();
 
-    // Browse, walk up a level, then take the folder that is showing.
-    harness.click(Hit::BrowseButton);
-    harness.click(Hit::PickerParent);
-    harness.click(Hit::PickerUse);
-    assert!(harness.app.modal.is_none());
-    let chosen = harness.app.directory.value().trim().to_string();
-    assert!(
-        temporary
-            .path()
-            .canonicalize()
-            .unwrap()
-            .starts_with(&chosen)
-            && Path::new(&chosen) != temporary.path(),
-        "{chosen}"
-    );
-
-    // Cancel backs out without touching the path.
-    harness.click(Hit::BrowseButton);
-    harness.click(Hit::PickerCancel);
+    harness.click(Hit::Help);
+    assert!(matches!(harness.app.modal, Some(Modal::Help)));
+    harness.click(Hit::CloseModal);
     assert!(harness.app.modal.is_none());
 
-    harness
-        .app
-        .directory
-        .set_value(&temporary.path().to_string_lossy());
-    harness.click(Hit::PreviewButton);
-    harness.settle(fresh_preview);
-
-    // The chips on the results border tick every row and none of them.
-    harness.click(Hit::TickNone);
-    assert_eq!(harness.app.preview.as_ref().unwrap().ticked_count(), 0);
-    assert!(!harness.app.can_apply());
-    harness.click(Hit::TickAll);
-    assert_eq!(harness.app.preview.as_ref().unwrap().ticked_count(), 2);
-
-    // Apply asks first, and the dialog answers to its own buttons.
-    harness.click(Hit::ApplyButton);
-    harness.click(Hit::ConfirmCancel);
-    assert!(harness.app.modal.is_none());
-    assert!(temporary
-        .path()
-        .join("[Group] Nebula Archive - S01E01.chs.ass")
-        .exists());
-
-    harness.click(Hit::ApplyButton);
-    harness.click(Hit::ConfirmApply);
-    harness.settle(|app| !app.applying);
-    assert!(temporary
-        .path()
-        .join("Nebula.Archive.S01E01.1080p.ass")
-        .exists());
-
-    // Help opens and closes from the header and its own button.
-    harness.click(Hit::HelpButton);
-    assert!(matches!(
-        harness.app.modal,
-        Some(beaver::tui::app::Modal::Help)
-    ));
-    harness.click(Hit::HelpClose);
-    assert!(harness.app.modal.is_none());
-
-    harness.click(Hit::QuitButton);
+    harness.click(Hit::Quit);
     assert!(harness.app.should_quit);
-}
-
-/// A short terminal cannot show the whole setup column, and the keyboard only
-/// scrolls it by moving the focus — which a pointer cannot do. Without a wheel
-/// over the column the action buttons are simply unreachable by mouse.
-#[test]
-fn the_wheel_reaches_the_setup_buttons_in_a_short_terminal() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-    harness.terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    harness.draw();
-
-    // The column opens on the path field, so the buttons are off the bottom.
-    assert!(!harness.screen().contains("Preview (p)"));
-
-    // The wheel over the setup panel brings them up.
-    let setup = harness.app.setup_area;
-    for _ in 0..4 {
-        harness.app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: setup.x + setup.width / 2,
-            row: setup.y + setup.height / 2,
-            modifiers: KeyModifiers::NONE,
-        });
-        harness.draw();
-    }
-    let screen = harness.screen();
-    assert!(screen.contains("Preview (p)"), "{screen}");
-
-    // And it is a live target, not just painted.
-    harness.click(Hit::PreviewButton);
-    harness.settle(fresh_preview);
-    assert!(harness.app.can_apply());
-}
-
-/// The wheel moves the highlight in whichever list is on top.
-#[test]
-fn the_wheel_scrolls_the_results_and_the_picker() {
-    let temporary = library();
-    let mut harness = Harness::new(temporary.path());
-    harness.press(KeyCode::Enter);
-    harness.settle(fresh_preview);
-
-    harness.wheel(MouseEventKind::ScrollDown);
-    assert_eq!(
-        harness
-            .app
-            .preview
-            .as_ref()
-            .unwrap()
-            .matched_state
-            .selected(),
-        Some(1)
-    );
-    harness.wheel(MouseEventKind::ScrollUp);
-    assert_eq!(
-        harness
-            .app
-            .preview
-            .as_ref()
-            .unwrap()
-            .matched_state
-            .selected(),
-        Some(0)
-    );
 }

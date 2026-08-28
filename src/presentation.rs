@@ -49,7 +49,7 @@ impl MatchLevel {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Relaxed => "Matches more, for messy naming",
-            Self::Balanced => "Recommended; coverage and accuracy",
+            Self::Balanced => "Recommended, balanced coverage",
             Self::Cautious => "Only near-certain matches",
         }
     }

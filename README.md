@@ -38,39 +38,45 @@ beaver --tui ~/Videos/Some.Show
 
 During development, `cargo run` does the same thing.
 
-### Three-step workflow
+### The four steps
 
-1. **Point at a folder.** Type or paste a path, or press `o` to browse. `Enter` starts a preview
-   without leaving the field.
-2. **Read the preview.** It is entirely read-only: a summary line, a checkbox list of proposed
-   renames, and a table of what was skipped and why.
-3. **Tick and apply.** Untick anything you do not want, press `a`, and confirm.
+The interface is a wizard: one step is on screen at a time, and a bar of dots across the top says
+where you are.
 
-Changing the directory, the subfolder switch, the strict switch, or the match level invalidates the
-preview immediately — apply stays disabled until you preview again.
+1. **Folder.** Type or paste a path, press `o` to browse, or press `d` for a demo library that looks
+   real and writes nothing. `Enter` moves on.
+2. **Rules.** Two of them: a match level, and whether subfolders are included. `Enter` starts the
+   scan.
+3. **Preview.** Entirely read-only: a ticked count, a checkbox list of proposed renames, and the
+   skipped subtitles behind `s`. Untick anything you do not want and press `a`.
+4. **Apply.** A progress bar while the renames land, then what happened. `Enter` starts over.
 
-Press `d` for demo mode, which loads a sample library so you can see the whole workflow without a
-real folder. Demo plans can never be applied.
+Going back with `←` and changing a rule drops the preview, so the list you apply is always the list
+the current rules produced.
 
 ### Shortcuts
 
-Arrow keys drive everything; the vim keys are aliases, not a separate mode.
+`Enter` always means forward, from wherever the keyboard is. `Space` presses the focused control in
+place. Left and right walk the wizard; up and down stay inside the card. The vim keys are aliases,
+not a separate mode.
 
 | Key                  | Vim     | Action                                       |
 | -------------------- | ------- | -------------------------------------------- |
+| `Enter`              |         | Forward one step                             |
+| `←` `→`              | `h` `l` | Back / forward one step                      |
+| `Esc`                |         | Back one step, or leave the path field       |
+| `↑` `↓`              | `k` `j` | Move inside the current step                 |
 | `Tab` / `Shift+Tab`  |         | Next / previous control                      |
-| `↑` `↓`              | `k` `j` | Move within a control, and between them      |
-| `←` `→`              | `h` `l` | Set the focused option, or switch tab        |
-| `Home` / `End`       | `g` `G` | First / last row                             |
+| `Space`              |         | Press the focused control                    |
+| `Home` / `End`       | `g` `G` | First / last rename                          |
 | `PgUp` / `PgDn`      | `Ctrl+U` / `Ctrl+D` | A page, or half of one           |
-| `Space`              |         | Tick or untick the highlighted rename        |
-| `Enter`              |         | Preview from the path field, else as `Space` |
 | `Ctrl+A` / `Ctrl+R`  |         | Tick everything / nothing                    |
-| `Esc` / `i`          |         | Leave / enter the path field                 |
-| `p`                  |         | Preview                                      |
+| `s`                  |         | The skipped subtitles, and why               |
+| `i`                  |         | Back into the path field                     |
+| `p`                  |         | Rescan                                       |
 | `a`                  |         | Apply the ticked renames                     |
-| `d`                  |         | Demo mode                                    |
-| `o`                  |         | Browse for a directory                       |
+| `d`                  |         | Demo library                                 |
+| `o`                  |         | Browse for a folder                          |
 | `?`                  |         | Shortcut list                                |
 | `q`                  |         | Quit                                         |
 
@@ -78,10 +84,9 @@ The footer always spells out the keys the focused control answers to right now, 
 has to be memorised.
 
 Single-letter shortcuts type into the path field while it has focus. Press `Tab`, `Esc` or `↓` to
-leave it, or `Enter` to preview from there; a successful preview moves focus to the results list, so
-the verbs work straight away. Inside the field the control keys are the shell's: `Ctrl+A` / `Ctrl+E`
-jump to either end, and `Ctrl+U` / `Ctrl+K` / `Ctrl+W` delete the line, the tail, or one path
-segment.
+leave it, `Enter` to move on from there, and `i` to get back in. Inside the field the control keys
+are the shell's: `Ctrl+A` / `Ctrl+E` jump to either end, and `Ctrl+U` / `Ctrl+K` / `Ctrl+W` delete
+the line, the tail, or one path segment.
 
 ### Match level
 
@@ -101,7 +106,9 @@ Episode-ID matches ignore the threshold entirely.
 - Every source and destination is fingerprinted when the preview is built and checked again just
   before renaming. If anything moved in between, the **entire batch is refused** — no partial
   application — and you are asked to preview again.
-- Existing files are never overwritten. The terminal interface does not expose the CLI's `--force`.
+- Existing files are never overwritten. The terminal interface does not expose the CLI's `--force`,
+  and it always matches strictly: a subtitle whose target name is already taken is skipped rather
+  than given an invented suffix. `--strict` is the CLI's way to ask for the same thing.
 - Applying runs on a worker thread, as does scanning, so a large recursive directory never freezes
   the interface.
 
@@ -153,13 +160,13 @@ matter, generate a throwaway library:
 
 ```bash
 scripts/make-demo-library.sh          # creates demo-library/ at the repository root
-cargo run -- --tui demo-library       # then turn on "include subfolders" and press p
+cargo run -- --tui demo-library       # then turn on "include subfolders" on step 2
 ```
 
 It contains fake videos and subtitles named the way real releases are, arranged so every outcome
 shows up at once: episode-ID matches, fuzzy matches at three different strengths, a missing episode,
 files already named correctly, a taken target name, an episode two videos claim, CJK names, and
-subtitles with no video beside them. Stepping the match level or flipping the strict switch visibly
+subtitles with no video beside them. Stepping the match level or turning on subfolders visibly
 changes the plan.
 
 Renaming mutates the folder, so re-run the script for a clean slate. It only ever writes to a

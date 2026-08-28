@@ -169,6 +169,22 @@ pub fn apply_operations(
     force: bool,
     verify: bool,
 ) -> Result<ApplyResult, PlanChanged> {
+    apply_operations_reporting(operations, root, force, verify, |_| {})
+}
+
+/// [`apply_operations`], calling `progress` with the number finished after each
+/// rename.
+///
+/// The interface draws a real progress bar rather than an indeterminate spinner,
+/// and a bar needs a count that arrives while the batch is still running — so the
+/// caller passes a sink instead of waiting for the finished [`ApplyResult`].
+pub fn apply_operations_reporting(
+    operations: &[PreparedOperation],
+    root: &Path,
+    force: bool,
+    verify: bool,
+    mut progress: impl FnMut(usize),
+) -> Result<ApplyResult, PlanChanged> {
     if verify {
         let changes = detect_state_changes(operations);
         if !changes.is_empty() {
@@ -177,7 +193,7 @@ pub fn apply_operations(
     }
 
     let mut result = ApplyResult::default();
-    for prepared in operations {
+    for (index, prepared) in operations.iter().enumerate() {
         let source = prepared.source();
         let destination = prepared.destination();
         let outcome = ApplyOutcome {
@@ -193,6 +209,7 @@ pub fn apply_operations(
                 ..outcome
             }),
         }
+        progress(index + 1);
     }
     Ok(result)
 }
