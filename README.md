@@ -1,190 +1,256 @@
-# beaver
+<p align="center">
+  <a href="./README.md"><kbd>English</kbd></a>
+  <a href="./README.zh-CN.md"><kbd>简体中文</kbd></a>
+</p>
 
-A local tool for matching subtitle filenames (`.ass`, `.srt`, and more) to the video files beside
-them (`.mkv`, `.mp4`, and more). It runs as a terminal interface, with a command-line mode kept for
-scripting.
+<p align="center">
+  <img src="./docs/assets/beaver-logo.png" alt="beaver logo" width="144">
+</p>
 
-Everything happens on your computer. No filename or file content ever leaves it.
+<h1 align="center">beaver</h1>
 
-## Requirements
+<p align="center">Rename subtitle files to match the videos beside them.</p>
 
-- Rust 1.88 or newer
+<p align="center">
+  <img src="./docs/assets/beaver-demo.gif" alt="beaver terminal interface demo" width="720">
+</p>
 
-## Build
+beaver scans a video library and proposes names for the subtitle files in the same folders. It
+uses directory entries, filenames, extensions, and file metadata for the pre-apply safety check. It
+does not open video streams or read subtitle contents. Everything stays local. There is no upload,
+cache, or history.
 
-From the repository root:
+With `--recursive`, beaver also scans subfolders. Matching is still per directory. A subtitle is
+never matched with a video from a different folder.
+
+## How the workflow works
+
+The TUI path is the one shown here. The CLI uses the same planner, but its apply path is separate.
+
+```mermaid
+flowchart TD
+    A[Input directory] --> B[Collect video and subtitle files<br/>grouped by directory]
+    B --> C{Subtitle has an episode ID?}
+    C -- Yes --> D[Match the same episode ID]
+    C -- No --> E[Normalize stems and score<br/>Ratcliff/Obershelp]
+    D --> F{Accepted candidate?}
+    E --> F
+    F -- No --> G[Keep the subtitle in the skipped list]
+    F -- Yes --> H[Build a rename proposal]
+    H --> I[Preview proposals and capture file state]
+    I --> J[Tick the subtitles to apply]
+    J --> K[Confirm the batch]
+    K --> L[TUI: compare current state with the preview]
+    L --> M{State still matches?}
+    M -- Yes --> N[Rename the selected subtitles]
+    M -- No --> O[Reject the whole batch<br/>rename nothing]
+```
+
+The CLI default and `--dry-run` only print the plan. `--apply` plans and applies in one pass, with
+an interactive confirmation unless `--yes` is supplied. It does not run the TUI's second
+state-check phase. The TUI always checks the selected batch again immediately before renaming.
+
+## TUI
+
+Run `beaver` without a path, or pass one with `beaver --tui`:
+
+```bash
+beaver
+beaver --tui ~/Videos/Some.Show
+```
+
+The interface has four steps. Only the current step is live.
+
+| Step | What happens |
+| --- | --- |
+| Folder | Type or paste a directory path. Press `o` or click `Browse` to open the folder picker. |
+| Rules | Choose `Relaxed`, `Balanced`, or `Cautious`, then choose whether to include subfolders. Changing either rule discards the old preview. |
+| Preview | Review proposed renames. All proposals start checked. Move through the list, click a row, or use `Space` to toggle it. Press `s` to inspect skipped subtitles. |
+| Apply | Press `a` or the forward button. Beaver asks for confirmation, checks the selected files again, and shows a real progress bar while it renames. |
+
+The TUI is always strict. It never invents a suffix for a taken target name and never overwrites an
+existing file. There is no TUI strict switch and no TUI `--force` equivalent.
+
+Mouse input is supported throughout the interface. Left-click a field, control, button, step that
+has already been visited, or list row. A click selects a preview row; a second click on the already
+selected row toggles its checkbox. The mouse wheel moves the list under it, including the skipped and
+folder-picker lists. Keyboard control remains available at every step.
+
+After an apply finishes, the preview is discarded because it no longer describes the files on disk.
+The next run starts over and scans again.
+
+### Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Move forward. On the confirmation dialog, confirm. On the final step, start over. |
+| `←` / `→` or `h` / `l` | Go back or forward one wizard step. |
+| `Esc` | Go back, leave the path field, or close the current dialog. |
+| `↑` / `↓` or `k` / `j` | Move within the current step or list. |
+| `Tab` / `Shift+Tab` | Move to the next or previous control. |
+| `Space` | Activate the focused control, including the highlighted preview checkbox. |
+| `Home` / `End` or `g` / `G` | Jump to the first or last row in a list. |
+| `PgUp` / `PgDn` | Move one page in a list. |
+| `Ctrl+U` / `Ctrl+D` | Move half a page up or down in a list. |
+| `Ctrl+A` / `Ctrl+R` | Check all or none on the Preview step. |
+| `s` | Open the skipped-subtitles list on Preview, or close it. |
+| `p` | Rescan the current folder from the Preview step. |
+| `a` | Open Apply confirmation for the checked proposals. |
+| `o` | Open the folder picker. |
+| `i` | Focus the path field. |
+| `?` or `F1` | Open the shortcut help. |
+| `q` or `Ctrl+C` | Quit. |
+| `y` / `n` | Confirm or cancel the Apply dialog. `Esc` and `q` also cancel it. |
+
+While the path field is focused, letters type into the path instead of triggering shortcuts. In
+that field, `Ctrl+A` and `Ctrl+E` move to the start and end, `Ctrl+U` clears the line, `Ctrl+K`
+deletes the tail, and `Ctrl+W` or `Alt+Backspace` deletes the previous path segment. `Tab`, `Esc`,
+or `↓` leaves the field. `Enter` moves on.
+
+## Installation and running
+
+Rust 1.88 or newer is required.
+
+Build a release binary:
 
 ```bash
 cargo build --release
 ```
 
-The binary lands in `target/release/beaver`. To put it on your `PATH`:
+The binary is `target/release/beaver`. Install it on your `PATH` with:
 
 ```bash
 cargo install --path .
 ```
 
-## Terminal interface
+Then start the TUI with either command:
 
 ```bash
 beaver
+beaver --tui /path/to/library
 ```
 
-Or with a folder already filled in:
+For a checkout-local run, use `cargo run --` before the same arguments, for example
+`cargo run -- --tui /path/to/library`.
 
-```bash
-beaver --tui ~/Videos/Some.Show
-```
-
-During development, `cargo run` does the same thing.
-
-### The four steps
-
-The interface is a wizard: one step is on screen at a time, and a bar of dots across the top says
-where you are.
-
-1. **Folder.** Type or paste a path, or press `o` to browse. `Enter` moves on.
-2. **Rules.** Two of them: a match level, and whether subfolders are included. `Enter` starts the
-   scan.
-3. **Preview.** Entirely read-only: a ticked count, a checkbox list of proposed renames, and the
-   skipped subtitles behind `s`. Untick anything you do not want and press `a`.
-4. **Apply.** A progress bar while the renames land, then what happened. `Enter` starts over.
-
-Going back with `←` and changing a rule drops the preview, so the list you apply is always the list
-the current rules produced.
-
-### Shortcuts
-
-`Enter` always means forward, from wherever the keyboard is. `Space` presses the focused control in
-place. Left and right walk the wizard; up and down stay inside the card. The vim keys are aliases,
-not a separate mode.
-
-| Key                  | Vim     | Action                                       |
-| -------------------- | ------- | -------------------------------------------- |
-| `Enter`              |         | Forward one step                             |
-| `←` `→`              | `h` `l` | Back / forward one step                      |
-| `Esc`                |         | Back one step, or leave the path field       |
-| `↑` `↓`              | `k` `j` | Move inside the current step                 |
-| `Tab` / `Shift+Tab`  |         | Next / previous control                      |
-| `Space`              |         | Press the focused control                    |
-| `Home` / `End`       | `g` `G` | First / last rename                          |
-| `PgUp` / `PgDn`      | `Ctrl+U` / `Ctrl+D` | A page, or half of one           |
-| `Ctrl+A` / `Ctrl+R`  |         | Tick everything / nothing                    |
-| `s`                  |         | The skipped subtitles, and why               |
-| `i`                  |         | Back into the path field                     |
-| `p`                  |         | Rescan                                       |
-| `a`                  |         | Apply the ticked renames                     |
-| `o`                  |         | Browse for a folder                          |
-| `?`                  |         | Shortcut list                                |
-| `q`                  |         | Quit                                         |
-
-The footer always spells out the keys the focused control answers to right now, so nothing above
-has to be memorised.
-
-Single-letter shortcuts type into the path field while it has focus. Press `Tab`, `Esc` or `↓` to
-leave it, `Enter` to move on from there, and `i` to get back in. Inside the field the control keys
-are the shell's: `Ctrl+A` / `Ctrl+E` jump to either end, and `Ctrl+U` / `Ctrl+K` / `Ctrl+W` delete
-the line, the tail, or one path segment.
-
-### Match level
-
-Instead of a raw threshold, the fuzzy matcher is exposed as three named levels:
-
-| Level        | Threshold | Use when                                       |
-| ------------ | --------- | ---------------------------------------------- |
-| Relaxed      | 0.60      | Naming is messy and you will review each match |
-| Balanced     | 0.72      | Default                                        |
-| Cautious     | 0.84      | You only want near-certain matches             |
-
-Episode-ID matches ignore the threshold entirely.
-
-### Safety model
-
-- The preview never writes. Only the apply step touches the filesystem.
-- Every source and destination is fingerprinted when the preview is built and checked again just
-  before renaming. If anything moved in between, the **entire batch is refused** — no partial
-  application — and you are asked to preview again.
-- Existing files are never overwritten. The terminal interface does not expose the CLI's `--force`,
-  and it always matches strictly: a subtitle whose target name is already taken is skipped rather
-  than given an invented suffix. `--strict` is the CLI's way to ask for the same thing.
-- Applying runs on a worker thread, as does scanning, so a large recursive directory never freezes
-  the interface.
-
-## CLI usage
+## CLI
 
 ### Dry run
 
-```bash
-beaver /path/to/folder --dry-run
-```
-
-A path with no `--dry-run` or `--apply` is a dry run as well.
-
-### Apply renames
+No mode flag is also a dry run when a path is supplied:
 
 ```bash
-beaver /path/to/folder --apply --yes
+beaver /path/to/library
+beaver /path/to/library --dry-run
 ```
 
-### Common options
+Both commands print the plan and leave the files alone.
 
-- `-r`, `--recursive`: process subfolders as well
-- `--level relaxed|balanced|cautious`: how eager fuzzy matching should be
-- `--min-score 0.72`: an explicit threshold, overriding `--level`
-- `--video-ext`, `--sub-ext`: extensions to include, repeatable, with or without a leading dot
-- `--strict`: skip a subtitle when the exact target filename would collide
-- `--force`: allow overwriting existing files in the CLI only; use with care
-
-The CLI plans and applies in a single pass, so it skips the re-verification step the terminal
-interface performs. Like the TUI, it refuses to overwrite an existing target unless `--force` is
-given.
-
-## How matching works
-
-1. **Episode ID match** is preferred when filenames contain `SxxEyy` (for example, `S02E01`) or
-   `2x01`.
-2. **Fuzzy stem match** is used when an episode ID is unavailable. Common release metadata is
-   removed before comparing filename stems, which are then scored with the Ratcliff/Obershelp
-   measure. A match is only taken when it is clearly ahead of the runner-up.
-3. **Collision handling** keeps the original extension, uses a detected language suffix when
-   possible, then falls back to a numeric suffix. Strict mode skips collisions instead.
-
-Matching is scoped per directory: a subtitle is only ever matched against videos in its own folder.
-
-## A folder to practise on
-
-To try a real apply on files that do not matter, generate a throwaway library:
+### Apply
 
 ```bash
-scripts/make-demo-library.sh          # creates demo-library/ at the repository root
-cargo run -- --tui demo-library       # then turn on "include subfolders" on step 2
+beaver /path/to/library --apply
+beaver /path/to/library --apply --yes
 ```
 
-It contains fake videos and subtitles named the way real releases are, arranged so every outcome
-shows up at once: episode-ID matches, fuzzy matches at three different strengths, a missing episode,
-files already named correctly, a taken target name, an episode two videos claim, CJK names, and
-subtitles with no video beside them. Stepping the match level or turning on subfolders visibly
-changes the plan.
+Without `--yes`, the CLI asks before it renames. The CLI does not use the TUI's batch re-verification
+step. By default it still refuses to overwrite an existing target while applying.
 
-Renaming mutates the folder, so re-run the script for a clean slate. It only ever writes to a
-directory it created itself, `.gitignore` keeps it out of the repository, and `rm -rf demo-library`
-removes it. Pass a path to put it somewhere else.
+### Important options
 
-## Layout
+| Option | Meaning |
+| --- | --- |
+| `--tui` | Open the TUI. A supplied path fills its Folder step. |
+| `-r`, `--recursive` | Include subfolders in the scan. Matching remains within each folder. |
+| `--level relaxed\|balanced\|cautious` | Select the fuzzy threshold. `balanced` is the default. |
+| `--min-score SCORE` | Set an explicit fuzzy threshold from `0` to `1`, overriding `--level`. |
+| `--video-ext EXT` | Use the supplied video extension set. Repeat it for multiple extensions. A leading dot is optional. |
+| `--sub-ext EXT` | Use the supplied subtitle extension set. Repeat it for multiple extensions. A leading dot is optional. |
+| `--strict` | Skip a proposal when its plain target name is already taken. |
+| `--force` | CLI only. Allow an apply to overwrite an existing target. It conflicts with `--strict`. |
+| `--dry-run` | Print the plan without changing anything. This is the default for a path run. |
+| `--apply` | Apply the plan after confirmation. |
+| `-y`, `--yes` | Skip the CLI apply prompt. |
 
+`--video-ext` and `--sub-ext` are case-insensitive. If they are omitted, beaver considers these
+types:
+
+- Video: `.mkv`, `.mp4`, `.avi`, `.mov`, `.wmv`, `.m4v`, `.webm`
+- Subtitle: `.ass`, `.srt`, `.ssa`, `.vtt`, `.sub`
+
+## Matching rules
+
+1. **Classify by extension.** Beaver collects recognized video and subtitle files and groups them
+   by their parent directory. It does not compare across directories.
+2. **Prefer episode IDs.** A subtitle containing `SxxEyy` or `2x01` is matched to a video with the
+   same normalized ID, such as `S02E01`. Separators between the parts are allowed. If that ID has
+   no matching video, the subtitle is skipped rather than sent through fuzzy matching. If two
+   videos claim the same ID, that ID is ambiguous and its subtitle is skipped.
+3. **Use fuzzy matching only without an episode ID.** Beaver removes bracketed groups, common release
+   metadata, trailing language tags, and filename separators from each stem. It then compares the
+   remaining characters with the Ratcliff/Obershelp measure. The best candidate must meet the
+   selected threshold and lead the runner-up by at least `0.06`. A near miss stays in the skipped
+   list with its best score.
+
+The named fuzzy levels map to fixed thresholds:
+
+| Level | Threshold | Use it when |
+| --- | ---: | --- |
+| Relaxed | `0.60` | Names are messy and you will review the preview closely. |
+| Balanced | `0.72` | You want the default balance between coverage and caution. |
+| Cautious | `0.84` | You only want very close fuzzy matches. |
+
+Episode-ID matches ignore the fuzzy threshold.
+
+The normal target is `VideoName.subtitle-extension`. Beaver keeps the subtitle's extension. In
+non-strict CLI mode, a taken target first gets a detected language tag when available, then a numeric
+suffix. `--strict` skips that collision, and TUI behavior is always strict. `--force` is available
+only in the CLI and allows the plain target to replace an existing file.
+
+## Safety and local behavior
+
+- Preview and dry-run never write. Only an apply action can rename files.
+- TUI Apply asks for confirmation before starting.
+- When the TUI preview is created, each selected source and destination gets a lightweight
+  fingerprint. The TUI compares those states immediately before applying. If any selected path has
+  changed, the entire selected batch is refused and nothing from that batch is renamed.
+- The TUI scans and applies on worker threads, so a large recursive scan does not freeze the
+  interface. CLI work runs as a normal command-line operation.
+- The program does not upload files and has no cache or history to consult.
+- The TUI never overwrites. CLI `--force` is the only overwrite path.
+
+## Try it with a generated library
+
+The script creates a disposable directory with fake videos and subtitles. The video files are
+placeholders, not playable containers.
+
+```bash
+scripts/make-demo-library.sh
+cargo run -- --tui demo-library
 ```
+
+Turn on `Include subfolders` in Rules to see the nested cases. The generated library includes
+episode-ID matches, fuzzy matches at different levels, an absent episode, already matching names,
+collision cases, an ambiguous episode ID, CJK names, and subtitles with no video in their folder.
+
+The script accepts an optional target directory and only removes a target it previously marked as
+one of its own demo libraries. Re-run it after an apply to restore the original names.
+
+## Source layout
+
+```text
 src/
-├── planning.rs       # pure matching core, no I/O beyond reading directory entries
-├── applying.rs       # two-phase safe execution, shared by both front-ends
-├── names.rs          # filename normalisation, episode IDs, language tags
-├── similarity.rs     # Ratcliff/Obershelp string similarity
-├── presentation.rs   # match levels, human wording, demo data
-├── paths.rs          # path helpers
+├── planning.rs       # read-only matching and rename planning
+├── applying.rs       # state checks, confirmation data, and filesystem renames
+├── names.rs          # stem normalization, episode IDs, and language tags
+├── similarity.rs     # Ratcliff/Obershelp similarity
+├── presentation.rs   # match levels, labels, and demo data
+├── paths.rs          # path expansion and display helpers
 ├── cli.rs            # command-line front-end
-└── tui/              # terminal front-end (ratatui)
+└── tui/              # four-step terminal front-end
 
 scripts/
-└── make-demo-library.sh   # throwaway files to try the interface on
+└── make-demo-library.sh
 ```
 
 ## Tests and checks
@@ -195,6 +261,9 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
-The terminal interface is tested end to end: keystrokes go in, a frame is rendered to a test
-backend, and the text on screen is what the assertions read — against real files in a temporary
-directory.
+The TUI tests drive key and mouse events through a `ratatui` test backend. CLI tests run the real
+binary against temporary directories.
+
+## License
+
+beaver is licensed under [GNU AGPL v3.0 only](./LICENSE).
