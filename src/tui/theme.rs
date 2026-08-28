@@ -23,7 +23,6 @@ const BLUE: Color = Color::Rgb(0x89, 0xb4, 0xfa);
 const TEAL: Color = Color::Rgb(0x94, 0xe2, 0xd5);
 const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
-const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
 
 /// The page floor.
@@ -52,8 +51,6 @@ pub const CERTAIN: Color = TEAL;
 pub const SUCCESS: Color = GREEN;
 /// Something is fine but not resting: a scan in flight, a stale preview.
 pub const WORKING: Color = YELLOW;
-/// Demo mode, which looks real but writes nothing.
-pub const DEMO: Color = PEACH;
 /// Something failed or was refused.
 pub const ERROR: Color = RED;
 /// The row the cursor is on.
@@ -67,6 +64,10 @@ pub const TICK: Color = GREEN;
 /// so every button answers a hover rather than only the quiet ones.
 pub fn hovered_fill(background: Color) -> Color {
     match background {
+        // A resting button sits on the card's own surface, so its hover has to
+        // come from the same ramp one step up, or it answers the pointer with
+        // nothing at all.
+        SURFACE => SELECTION_BACKGROUND,
         SELECTION_BACKGROUND => HOVER,
         FOCUS => LAVENDER,
         SUCCESS => TEAL,

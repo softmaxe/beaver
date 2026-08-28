@@ -88,7 +88,10 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
                 .add_modifier(Modifier::BOLD)
                 .bg(theme::PANEL),
         ),
-        Span::styled("  subtitles → videos", theme::faint().bg(theme::PANEL)),
+        Span::styled(
+            "  rename subtitles to match their videos",
+            theme::faint().bg(theme::PANEL),
+        ),
     ]);
     frame.render_widget(Paragraph::new(title), area);
 
@@ -131,17 +134,25 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// The bar of dots: where the wizard is, what it has been through, what is left.
+///
+/// Every label is centred on its own dot, so a step reads as one column rather
+/// than a dot with text hanging off its left edge.
 fn draw_steps(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.height < 2 {
         return;
     }
     let current = app.step.index();
-    let span = (Step::ORDER.len() * DOT_STRIDE) as u16;
-    let x = area.x + area.width.saturating_sub(span) / 2;
-    let width = span.min(area.width);
+    // The first label would run off the left of its own dot, so the whole row of
+    // dots starts that far in and the labels keep their centres.
+    let lead = Step::ORDER[0].label().width().saturating_sub(1) / 2;
 
     let mut dots: Vec<Span> = Vec::new();
     let mut labels: Vec<Span> = Vec::new();
+    // Where each step's label starts and ends on the second line, so the hit
+    // cells can cover the dot and its label together.
+    let mut label_spans: Vec<(usize, usize)> = Vec::new();
+    let mut used = 0usize;
+
     for (index, step) in Step::ORDER.into_iter().enumerate() {
         let (dot, dot_style, label_style) = match index.cmp(&current) {
             std::cmp::Ordering::Less => (
@@ -167,12 +178,33 @@ fn draw_steps(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             dots.push(Span::styled("─".repeat(DOT_STRIDE - 1), connector));
         }
-        labels.push(Span::styled(pad(step.label(), DOT_STRIDE), label_style));
+
+        let label = step.label();
+        let width = label.width();
+        // Centre on the dot, but never on top of the label before it.
+        let dot_column = index * DOT_STRIDE + lead;
+        let begin = dot_column
+            .saturating_sub(width.saturating_sub(1) / 2)
+            .max(used);
+        labels.push(Span::raw(" ".repeat(begin - used)));
+        labels.push(Span::styled(label.to_string(), label_style));
+        used = begin + width;
+        label_spans.push((begin, used));
     }
+
+    let dots_width = lead + (Step::ORDER.len() - 1) * DOT_STRIDE + 1;
+    let content = dots_width.max(used) as u16;
+    let x = area.x + area.width.saturating_sub(content) / 2;
+    let width = content.min(area.width);
 
     frame.render_widget(
         Paragraph::new(Line::from(dots)),
-        Rect::new(x, area.y, width, 1),
+        Rect::new(
+            (x + lead as u16).min(area.right().saturating_sub(1)),
+            area.y,
+            width.saturating_sub(lead as u16),
+            1,
+        ),
     );
     frame.render_widget(
         Paragraph::new(Line::from(labels)),
@@ -181,17 +213,14 @@ fn draw_steps(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // A dot walks back to a step already done. Forward has preconditions, so the
     // card's own button owns that direction.
-    for index in 0..Step::ORDER.len() {
-        let dot_x = x + (index * DOT_STRIDE) as u16;
-        if dot_x >= area.right() {
+    for (index, (begin, end)) in label_spans.into_iter().enumerate() {
+        let dot_column = index * DOT_STRIDE + lead;
+        let left = x + begin.min(dot_column) as u16;
+        let right = x + end.max(dot_column + 1) as u16;
+        if left >= area.right() {
             break;
         }
-        let cell = Rect::new(
-            dot_x,
-            area.y,
-            (DOT_STRIDE as u16).min(area.right() - dot_x),
-            2,
-        );
+        let cell = Rect::new(left, area.y, right.min(area.right()) - left, 2);
         app.hits.push((cell, Hit::Dot(index)));
     }
 }
@@ -204,7 +233,6 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         StatusKind::Ready => theme::MUTED,
         StatusKind::Working => theme::WORKING,
         StatusKind::Success => theme::SUCCESS,
-        StatusKind::Demo => theme::DEMO,
         StatusKind::Error => theme::ERROR,
     };
     let mut spans = vec![Span::raw(" ")];
@@ -351,7 +379,7 @@ fn draw_card(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Rows the fixed-size cards take, borders and padding included.
 fn card_height(app: &App) -> u16 {
     match app.step {
-        Step::Folder => 11,
+        Step::Folder => 10,
         Step::Rules => 13,
         Step::Apply => 11,
         Step::Preview => 20,
@@ -454,12 +482,6 @@ fn draw_folder(frame: &mut Frame, app: &mut App, area: Rect) {
             width,
         )
         .on(Hit::Control(Control::Browse)),
-        control_row(
-            button_line("Demo library", "d"),
-            app.is_focused(Control::Demo),
-            width,
-        )
-        .on(Hit::Control(Control::Demo)),
     ];
     render_rows(frame, app, area, rows);
 
@@ -557,11 +579,10 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let matched = preview.prepared.len();
     let ticked = preview.ticked_count();
     let skipped = preview.plan.skipped.len();
-    let is_demo = preview.is_demo;
 
     // Summary on the left, the two bulk keys on the right: four numbers do not
     // need four boxes, and the keys belong beside the list they act on.
-    let mut summary = vec![
+    let summary = vec![
         Span::styled(
             format!("{ticked}"),
             Style::default()
@@ -570,12 +591,6 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Span::styled(format!(" of {matched} ticked"), theme::muted()),
     ];
-    if is_demo {
-        summary.push(Span::styled(
-            "  ·  demo, nothing is written",
-            Style::default().fg(theme::DEMO),
-        ));
-    }
     let summary_line = Line::from(summary);
     frame.render_widget(
         Paragraph::new(summary_line),
@@ -969,7 +984,7 @@ fn draw_centred(frame: &mut Frame, area: Rect, text: &str, colour: Color) {
 const DIALOG_WIDTH: u16 = 72;
 
 fn draw_help(frame: &mut Frame, area: Rect, hover: Option<Position>, hits: &mut Vec<(Rect, Hit)>) {
-    const SHORTCUTS: [(&str, &str); 12] = [
+    const SHORTCUTS: [(&str, &str); 11] = [
         ("↵", "Forward, from wherever the keyboard is"),
         ("← →   h l", "Back and forward through the four steps"),
         ("↑ ↓   k j", "Move inside the step"),
@@ -979,7 +994,6 @@ fn draw_help(frame: &mut Frame, area: Rect, hover: Option<Position>, hits: &mut 
         ("g  G", "First / last rename"),
         ("s", "The subtitles that were skipped, and why"),
         ("o", "Browse for a folder"),
-        ("d", "Demo library — looks real, writes nothing"),
         ("a", "Apply the ticked renames"),
         ("?  q", "This list · quit"),
     ];

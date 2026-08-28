@@ -339,28 +339,6 @@ fn changing_a_rule_drops_the_preview_and_rescans() {
 }
 
 #[test]
-fn a_demo_writes_nothing_and_can_never_be_applied() {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut harness = Harness::new(temporary.path());
-
-    // Esc hands the keyboard out of the path field, where letters act.
-    harness.press(KeyCode::Esc);
-    harness.press(KeyCode::Char('d'));
-    harness.draw();
-
-    assert_eq!(harness.app.step, Step::Preview);
-    let screen = harness.screen();
-    assert!(screen.contains("demo, nothing is written"), "{screen}");
-    assert!(screen.contains("3 of 3 ticked"), "{screen}");
-    assert!(!harness.app.can_apply());
-
-    harness.press(KeyCode::Char('a'));
-    harness.draw();
-    assert!(harness.app.modal.is_none());
-    assert!(harness.footer().contains("Demo mode never writes to disk"));
-}
-
-#[test]
 fn bulk_ticking_moves_the_summary_line() {
     let temporary = library();
     let mut harness = Harness::new(temporary.path());
