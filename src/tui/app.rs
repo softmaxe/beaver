@@ -1,11 +1,14 @@
 //! State and behaviour of the terminal interface.
 //!
-//! The shape of the screen mirrors the shape of the task: point at a directory,
-//! read a preview that touches nothing, then tick off the renames you actually
-//! want. Only the apply step writes, and it re-checks the filesystem first.
+//! The screen is a wizard that runs left to right: point at a folder, set the
+//! two rules that matter, read a preview that touches nothing, then watch the
+//! renames land. One step is on screen at a time, so there is never a question
+//! about where to look — the step bar across the top says where you are and the
+//! card underneath holds everything that step needs.
 //!
 //! Scanning and applying both run on a worker thread and report back through a
-//! channel, so a large recursive directory never freezes the interface.
+//! channel, so a large recursive directory never freezes the interface, and the
+//! apply step draws a real progress bar rather than an indeterminate spinner.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -15,10 +18,11 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use ratatui::widgets::{ListState, TableState};
+use ratatui::widgets::ListState;
 
 use crate::applying::{
-    apply_operations, prepare_operations, ApplyResult, ApplyStatus, PlanChanged, PreparedOperation,
+    apply_operations_reporting, prepare_operations, ApplyResult, ApplyStatus, PlanChanged,
+    PreparedOperation,
 };
 use crate::paths::{display_path, file_name};
 use crate::planning::{plan_directory, PlanOptions, RenamePlan};
@@ -27,7 +31,7 @@ use crate::tui::input::TextInput;
 use crate::tui::picker::Picker;
 
 /// How many renames the confirmation dialog spells out before summarising.
-const CONFIRM_EXAMPLE_LIMIT: usize = 5;
+const CONFIRM_EXAMPLE_LIMIT: usize = 3;
 
 /// Rows a page key moves through a list, and half of it for `ctrl+d` / `ctrl+u`.
 const PAGE: isize = 10;
@@ -36,70 +40,94 @@ const HALF_PAGE: isize = 5;
 /// Rows one notch of the mouse wheel moves.
 const WHEEL: isize = 3;
 
+/// Strict matching is the only matching this interface offers.
+///
+/// The alternative silently appends a suffix when the target name is taken, and
+/// a rename tool that quietly invents a second name is exactly the surprise this
+/// redesign is trying to remove. The escape hatch stays on the command line.
+const STRICT: bool = true;
+
+// --------------------------------------------------------------------- the wizard
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Focus {
-    Directory,
-    Recursive,
-    Strict,
-    Level,
-    Results,
+pub enum Step {
+    Folder,
+    Rules,
+    Preview,
+    Apply,
 }
 
-impl Focus {
-    const ORDER: [Self; 5] = [
-        Self::Directory,
-        Self::Recursive,
-        Self::Strict,
-        Self::Level,
-        Self::Results,
-    ];
+impl Step {
+    pub const ORDER: [Self; 4] = [Self::Folder, Self::Rules, Self::Preview, Self::Apply];
 
-    fn step(self, delta: isize) -> Self {
-        let count = Self::ORDER.len() as isize;
-        let current = Self::ORDER
+    pub fn index(self) -> usize {
+        Self::ORDER
             .iter()
-            .position(|item| *item == self)
-            .unwrap_or(0) as isize;
-        Self::ORDER[(current + delta).rem_euclid(count) as usize]
+            .position(|step| *step == self)
+            .unwrap_or(0)
+    }
+
+    /// The word under this step's dot in the step bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Folder => "Folder",
+            Self::Rules => "Rules",
+            Self::Preview => "Preview",
+            Self::Apply => "Apply",
+        }
+    }
+
+    /// The title on the card, numbered so the bar and the card agree.
+    pub fn title(self) -> String {
+        format!("{} · {}", self.index() + 1, self.label())
     }
 }
 
+/// One focusable thing inside the current step.
+///
+/// Focus is an index into [`App::controls`] rather than a global enum: each step
+/// owns its own short list, which is what keeps a step from having to know about
+/// controls that belong to another one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tab {
-    Matched,
-    Skipped,
+pub enum Control {
+    /// The path field.
+    Path,
+    Browse,
+    Demo,
+    /// The three match levels, which behave as one control.
+    Level,
+    Recursive,
+    /// The list of proposed renames.
+    List,
+    Back,
+    /// The button that moves the wizard one step to the right.
+    Advance,
+    /// Start over, offered once an apply has finished.
+    Again,
 }
 
 /// What a left click can land on, registered by the draw pass as rectangles.
-///
-/// The draw pass knows where everything sits, so it records each clickable
-/// region as it renders; the mouse handler then looks the position up instead
-/// of recomputing layout. Rows carry their index, so one variant per kind of
-/// target is all the dispatch needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
-    Directory,
-    BrowseButton,
-    Recursive,
-    Strict,
-    Level(usize),
-    PreviewButton,
-    ApplyButton,
-    DemoButton,
-    HelpButton,
-    QuitButton,
+    Control(Control),
+    /// One of the three match levels.
+    LevelRow(usize),
+    /// One proposed rename.
+    Row(usize),
+    /// A dot in the step bar, for jumping back to a step already visited.
+    Dot(usize),
+    Help,
+    Quit,
     TickAll,
     TickNone,
-    Tab(Tab),
-    MatchedRow(usize),
-    SkippedRow(usize),
+    Skipped,
     PickerRow(usize),
     PickerParent,
     PickerUse,
     PickerCancel,
     ConfirmApply,
     ConfirmCancel,
-    HelpClose,
+    CloseModal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,37 +153,28 @@ impl Status {
     }
 }
 
-/// A preview: a plan, the checkboxes over it, and whether it still describes disk.
+/// A preview: a plan, the checkboxes over it, and whether it is only a sample.
 pub struct Preview {
     pub plan: RenamePlan,
     pub prepared: Vec<PreparedOperation>,
     pub ticked: Vec<bool>,
-    pub matched_state: ListState,
-    pub skipped_state: TableState,
+    pub state: ListState,
     pub is_demo: bool,
-    /// Set when an option changed, or when the files moved under the preview.
-    pub stale: bool,
 }
 
 impl Preview {
     fn new(plan: RenamePlan, is_demo: bool) -> Self {
         let prepared = prepare_operations(&plan);
-        let mut matched_state = ListState::default();
+        let mut state = ListState::default();
         if !prepared.is_empty() {
-            matched_state.select(Some(0));
-        }
-        let mut skipped_state = TableState::default();
-        if !plan.skipped.is_empty() {
-            skipped_state.select(Some(0));
+            state.select(Some(0));
         }
         Self {
             ticked: vec![true; prepared.len()],
             prepared,
             plan,
-            matched_state,
-            skipped_state,
+            state,
             is_demo,
-            stale: false,
         }
     }
 
@@ -173,29 +192,49 @@ impl Preview {
     }
 }
 
+/// How the apply step ended, which is the whole content of the last card.
+pub enum Outcome {
+    Done {
+        applied: usize,
+    },
+    Mixed {
+        applied: usize,
+        failed: usize,
+        error: String,
+    },
+    Refused {
+        reason: String,
+    },
+}
+
 pub enum Modal {
     Help,
+    Skipped(ListState),
     Confirm { count: usize, examples: Vec<String> },
     Picker(Picker),
 }
 
-/// A finished piece of background work.
+/// A finished — or advancing — piece of background work.
 enum Update {
     Scanned {
         generation: u64,
         result: Result<RenamePlan, String>,
     },
-    Applied(Result<ApplyResult, PlanChanged>),
+    Progress(usize),
+    Applied(Box<Result<ApplyResult, PlanChanged>>),
 }
 
 pub struct App {
+    pub step: Step,
+    /// Index into [`App::controls`] for the current step.
+    pub focus: usize,
     pub directory: TextInput,
     pub recursive: bool,
-    pub strict: bool,
     pub level: MatchLevel,
-    pub focus: Focus,
-    pub tab: Tab,
     pub preview: Option<Preview>,
+    pub outcome: Option<Outcome>,
+    /// Renames finished and renames requested, for the progress bar.
+    pub progress: (usize, usize),
     pub modal: Option<Modal>,
     pub status: Status,
     pub scanning: bool,
@@ -209,16 +248,6 @@ pub struct App {
     receiver: Receiver<Update>,
     /// Clickable regions of the frame just drawn, modal entries last.
     pub hits: Vec<(Rect, Hit)>,
-    /// The setup column as last drawn, and how far the wheel has scrolled it.
-    ///
-    /// A short terminal cannot show the whole column, and the keyboard scrolls
-    /// it by moving the focus — which a pointer has no way to do. Without this
-    /// the action buttons are simply off the bottom for a mouse-only user.
-    pub setup_area: Rect,
-    pub setup_scroll: usize,
-    /// The focus the setup column was last drawn for, so a focus change can
-    /// drag the view back without the wheel being overruled every frame.
-    pub setup_focus: Focus,
     /// Where the pointer is, so the draw pass can tint what it is over.
     pub hover: Option<Position>,
 }
@@ -233,18 +262,16 @@ impl App {
     pub fn new() -> Self {
         let (sender, receiver) = channel();
         Self {
+            step: Step::Folder,
+            focus: 0,
             directory: TextInput::default(),
             recursive: false,
-            strict: false,
             level: MatchLevel::default(),
-            focus: Focus::Directory,
-            tab: Tab::Matched,
             preview: None,
+            outcome: None,
+            progress: (0, 0),
             modal: None,
-            status: Status::new(
-                "Type a directory path, then press Enter to preview",
-                StatusKind::Ready,
-            ),
+            status: Status::new("Type or browse to a folder", StatusKind::Ready),
             scanning: false,
             applying: false,
             ticks: 0,
@@ -253,9 +280,6 @@ impl App {
             sender,
             receiver,
             hits: Vec::new(),
-            setup_area: Rect::ZERO,
-            setup_scroll: 0,
-            setup_focus: Focus::Directory,
             hover: None,
         }
     }
@@ -270,12 +294,45 @@ impl App {
         self.scanning || self.applying
     }
 
+    /// The focusable controls of the step on screen, in top-to-bottom order.
+    pub fn controls(&self) -> Vec<Control> {
+        match self.step {
+            Step::Folder => vec![
+                Control::Path,
+                Control::Browse,
+                Control::Demo,
+                Control::Advance,
+            ],
+            Step::Rules => vec![
+                Control::Level,
+                Control::Recursive,
+                Control::Back,
+                Control::Advance,
+            ],
+            Step::Preview if self.scanning => Vec::new(),
+            Step::Preview => vec![Control::List, Control::Back, Control::Advance],
+            Step::Apply if self.applying => Vec::new(),
+            Step::Apply => vec![Control::Again],
+        }
+    }
+
+    /// Which control holds the keyboard, if the step has any.
+    pub fn control(&self) -> Option<Control> {
+        self.controls().get(self.focus).copied()
+    }
+
+    pub fn is_focused(&self, control: Control) -> bool {
+        self.control() == Some(control)
+    }
+
     /// Whether the apply step is available right now.
     pub fn can_apply(&self) -> bool {
-        self.preview
-            .as_ref()
-            .is_some_and(|preview| !preview.is_demo && !preview.stale && preview.ticked_count() > 0)
+        self.step == Step::Preview
             && !self.busy()
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| !preview.is_demo && preview.ticked_count() > 0)
     }
 
     // --------------------------------------------------------------- worker results
@@ -294,120 +351,183 @@ impl App {
                     match result {
                         Ok(plan) => self.scan_succeeded(plan),
                         Err(error) => {
+                            self.step = Step::Rules;
+                            self.focus_on(Control::Advance);
                             self.status =
                                 Status::new(format!("Scan failed: {error}"), StatusKind::Error);
                         }
                     }
                 }
+                Update::Progress(done) => self.progress.0 = done,
                 Update::Applied(result) => {
                     self.applying = false;
-                    match result {
+                    match *result {
                         Ok(result) => self.apply_finished(&result),
                         Err(changed) => {
-                            self.mark_stale();
+                            self.preview = None;
+                            self.outcome = Some(Outcome::Refused {
+                                reason: changed.to_string(),
+                            });
                             self.status = Status::new(
-                                format!("Files changed on disk — preview again: {changed}"),
+                                "Files moved under the preview — nothing was renamed",
                                 StatusKind::Error,
                             );
                         }
                     }
+                    self.focus = 0;
                 }
             }
         }
     }
 
     fn scan_succeeded(&mut self, plan: RenamePlan) {
-        let (videos, subtitles) = (plan.video_count, plan.subtitle_count);
+        let (videos, subtitles, matched) =
+            (plan.video_count, plan.subtitle_count, plan.operations.len());
         self.preview = Some(Preview::new(plan, false));
-        self.tab = Tab::Matched;
+        self.step = Step::Preview;
+        self.focus = 0;
         self.status = if videos == 0 {
-            Status::new("No video files in this directory", StatusKind::Error)
+            Status::new("No video files in this folder", StatusKind::Error)
         } else if subtitles == 0 {
-            Status::new("No subtitle files in this directory", StatusKind::Error)
+            Status::new("No subtitle files in this folder", StatusKind::Error)
+        } else if matched == 0 {
+            Status::new(
+                "Nothing matched — try a looser match level",
+                StatusKind::Error,
+            )
         } else {
-            Status::new("Preview ready", StatusKind::Success)
+            Status::new(
+                "Preview ready — nothing has been written",
+                StatusKind::Ready,
+            )
         };
-        // Move off the path field so the single-letter shortcuts work at once.
-        if self
-            .preview
-            .as_ref()
-            .is_some_and(|preview| !preview.prepared.is_empty())
-        {
-            self.focus = Focus::Results;
-        }
     }
 
     fn apply_finished(&mut self, result: &ApplyResult) {
         // The files just moved, so the preview no longer describes what is on disk.
-        self.mark_stale();
+        self.preview = None;
         let applied = result.applied.len();
         let failed = result.failed.len();
-        self.status = match result.status() {
-            ApplyStatus::Completed => Status::new(
-                format!("Renamed {applied} {}", plural(applied, "file", "files")),
-                StatusKind::Success,
-            ),
-            ApplyStatus::Partial => Status::new(
-                format!(
-                    "Renamed {applied}, {failed} failed: {}",
-                    first_error(result)
-                ),
-                StatusKind::Error,
-            ),
-            ApplyStatus::Failed => Status::new(
-                format!("{failed} renames failed: {}", first_error(result)),
-                StatusKind::Error,
-            ),
-        };
-    }
-
-    fn mark_stale(&mut self) {
-        if let Some(preview) = self.preview.as_mut() {
-            preview.stale = true;
+        self.progress = (applied + failed, applied + failed);
+        match result.status() {
+            ApplyStatus::Completed => {
+                self.outcome = Some(Outcome::Done { applied });
+                self.status = Status::new(
+                    format!("Renamed {applied} {}", plural(applied, "file", "files")),
+                    StatusKind::Success,
+                );
+            }
+            ApplyStatus::Partial | ApplyStatus::Failed => {
+                let error = first_error(result);
+                self.status = Status::new(
+                    format!("{failed} {} failed", plural(failed, "rename", "renames")),
+                    StatusKind::Error,
+                );
+                self.outcome = Some(Outcome::Mixed {
+                    applied,
+                    failed,
+                    error,
+                });
+            }
         }
     }
 
     // ---------------------------------------------------------------------- actions
 
-    /// Pending scans and previews only describe the options they were generated from.
+    /// A changed rule makes any preview a description of a question nobody asked.
     fn invalidate_preview(&mut self) {
-        let scan_invalidated = self.scanning;
-        if scan_invalidated {
+        if self.scanning {
             // The worker cannot be cancelled, but advancing the generation makes
-            // its eventual answer harmless and frees the UI to preview again.
+            // its eventual answer harmless.
             self.generation = self.generation.wrapping_add(1);
             self.scanning = false;
         }
+        self.preview = None;
+    }
 
-        let preview_invalidated = self.preview.as_mut().is_some_and(|preview| {
-            let was_fresh = !preview.stale;
-            preview.stale = true;
-            was_fresh
-        });
-
-        if scan_invalidated || preview_invalidated {
-            self.status = Status::new("Options changed — preview again", StatusKind::Working);
+    /// The button on the right of every card: move one step along.
+    pub fn advance(&mut self) {
+        match self.step {
+            Step::Folder => self.leave_folder(),
+            Step::Rules => self.action_preview(),
+            Step::Preview => self.action_apply(),
+            Step::Apply => self.start_over(),
         }
     }
 
+    /// The button on the left of every card after the first: move one step back.
+    pub fn back(&mut self) {
+        match self.step {
+            Step::Folder => {}
+            Step::Rules => self.go_to(Step::Folder),
+            Step::Preview if self.scanning => {
+                self.invalidate_preview();
+                self.go_to(Step::Rules);
+            }
+            Step::Preview => self.go_to(Step::Rules),
+            Step::Apply if self.applying => {}
+            Step::Apply => self.start_over(),
+        }
+    }
+
+    fn go_to(&mut self, step: Step) {
+        self.step = step;
+        self.focus = 0;
+        if step == Step::Folder {
+            self.status = Status::new("Type or browse to a folder", StatusKind::Ready);
+        }
+    }
+
+    fn start_over(&mut self) {
+        self.outcome = None;
+        self.progress = (0, 0);
+        self.preview = None;
+        self.go_to(Step::Folder);
+    }
+
+    /// Leave the folder step, but only for a path that actually exists.
+    fn leave_folder(&mut self) {
+        match self.resolved_directory() {
+            Ok(_) => {
+                self.go_to(Step::Rules);
+                self.status = Status::new("Two rules, then a preview", StatusKind::Ready);
+            }
+            Err(message) => self.status = Status::new(message, StatusKind::Error),
+        }
+    }
+
+    fn resolved_directory(&self) -> Result<PathBuf, String> {
+        let raw = self.directory.value().trim().to_string();
+        if raw.is_empty() {
+            return Err("Enter a folder path first".into());
+        }
+        let directory = crate::paths::resolve(Path::new(&raw));
+        if !directory.is_dir() {
+            return Err(format!("Not a folder: {raw}"));
+        }
+        Ok(directory)
+    }
+
+    /// Scan the chosen folder, showing the preview step while the worker runs.
     pub fn action_preview(&mut self) {
         if self.busy() {
             return;
         }
-        let raw = self.directory.value();
-        let raw = raw.trim();
-        if raw.is_empty() {
-            self.status = Status::new("Enter a directory path first", StatusKind::Error);
-            return;
-        }
-        let directory = crate::paths::resolve(Path::new(raw));
-        if !directory.is_dir() {
-            self.status = Status::new(format!("Not a directory: {raw}"), StatusKind::Error);
-            return;
-        }
+        let directory = match self.resolved_directory() {
+            Ok(directory) => directory,
+            Err(message) => {
+                self.go_to(Step::Folder);
+                self.status = Status::new(message, StatusKind::Error);
+                return;
+            }
+        };
 
         self.generation += 1;
         self.scanning = true;
+        self.preview = None;
+        self.outcome = None;
+        self.step = Step::Preview;
+        self.focus = 0;
         self.status = Status::new("Scanning…", StatusKind::Working);
 
         let generation = self.generation;
@@ -419,17 +539,17 @@ impl App {
         });
     }
 
+    /// Load the sample library, which looks real and writes nothing.
     pub fn action_demo(&mut self) {
         if self.busy() {
             return;
         }
+        self.invalidate_preview();
+        self.outcome = None;
         self.preview = Some(Preview::new(demo_plan(), true));
-        self.tab = Tab::Matched;
-        self.focus = Focus::Results;
-        self.status = Status::new(
-            "Demo mode: sample data, nothing is written",
-            StatusKind::Demo,
-        );
+        self.step = Step::Preview;
+        self.focus = 0;
+        self.status = Status::new("Demo — sample data, nothing is written", StatusKind::Demo);
     }
 
     pub fn action_apply(&mut self) {
@@ -441,11 +561,7 @@ impl App {
             return;
         };
         if preview.is_demo {
-            self.status = Status::new("Demo mode never writes to disk", StatusKind::Error);
-            return;
-        }
-        if preview.stale {
-            self.status = Status::new("Options changed — preview again", StatusKind::Error);
+            self.status = Status::new("Demo mode never writes to disk", StatusKind::Demo);
             return;
         }
         let chosen = preview.chosen();
@@ -482,12 +598,18 @@ impl App {
         }
         let root = preview.plan.root.clone();
         self.applying = true;
-        self.status = Status::new("Applying…", StatusKind::Working);
+        self.progress = (0, chosen.len());
+        self.step = Step::Apply;
+        self.focus = 0;
+        self.status = Status::new("Renaming…", StatusKind::Working);
 
         let sender = self.sender.clone();
+        let progress = self.sender.clone();
         thread::spawn(move || {
-            let result = apply_operations(&chosen, &root, false, true);
-            let _ = sender.send(Update::Applied(result));
+            let result = apply_operations_reporting(&chosen, &root, false, true, |done| {
+                let _ = progress.send(Update::Progress(done));
+            });
+            let _ = sender.send(Update::Applied(Box::new(result)));
         });
     }
 
@@ -506,10 +628,24 @@ impl App {
         self.modal = Some(Modal::Picker(Picker::new(&start)));
     }
 
+    fn show_skipped(&mut self) {
+        let count = self
+            .preview
+            .as_ref()
+            .map(|preview| preview.plan.skipped.len())
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let mut state = ListState::default();
+        state.select(Some(0));
+        self.modal = Some(Modal::Skipped(state));
+    }
+
     fn plan_options(&self) -> PlanOptions {
         PlanOptions {
             recursive: self.recursive,
-            strict: self.strict,
+            strict: STRICT,
             min_score: self.level.score(),
             ..PlanOptions::default()
         }
@@ -520,28 +656,10 @@ impl App {
     /// Space on a rename. Says why nothing happened rather than staying silent,
     /// because a key that does nothing reads as a broken key.
     fn toggle_highlighted(&mut self) {
-        let tab = self.tab;
         let Some(preview) = self.preview.as_mut() else {
-            self.status = Status::new(
-                "Nothing to tick yet — p to preview, d for a demo",
-                StatusKind::Error,
-            );
             return;
         };
-        if tab != Tab::Matched {
-            self.status = Status::new(
-                "Skipped files are not renamed — press ← for the renames",
-                StatusKind::Ready,
-            );
-            return;
-        }
-        // A preview with nothing in it has no highlighted row to tick, which is
-        // the same dead key felt from the other direction.
-        let Some(index) = preview.matched_state.selected() else {
-            self.status = Status::new(
-                "Nothing matched here — try a looser match level, or another folder",
-                StatusKind::Ready,
-            );
+        let Some(index) = preview.state.selected() else {
             return;
         };
         if let Some(ticked) = preview.ticked.get_mut(index) {
@@ -566,38 +684,30 @@ impl App {
             self.request_quit();
             return;
         }
-        if self.applying && matches!(key.code, KeyCode::Char('q')) {
-            self.request_quit();
-            return;
-        }
         if self.modal.is_some() {
             self.handle_modal_key(key);
             return;
         }
 
         match key.code {
-            KeyCode::Tab => self.focus = self.focus.step(1),
-            KeyCode::BackTab => self.focus = self.focus.step(-1),
+            KeyCode::Tab => self.move_focus(1),
+            KeyCode::BackTab => self.move_focus(-1),
             KeyCode::F(1) => self.modal = Some(Modal::Help),
-            // Control keys mean one thing while text is being typed and another
-            // over a list, so each context claims its own.
-            _ if self.focus == Focus::Directory => self.handle_directory_key(key),
+            // Letters have to type rather than act while the path field is live,
+            // so the field claims every key it can possibly mean.
+            _ if self.is_focused(Control::Path) => self.handle_path_key(key),
             _ => self.handle_command_key(key),
         }
     }
 
-    /// While the path field has focus, letters have to type rather than act.
-    ///
-    /// The control keys are the ones a shell prompt answers to, so muscle memory
-    /// from the command line carries over.
-    fn handle_directory_key(&mut self, key: KeyEvent) {
+    /// While the path field has focus, the control keys are the ones a shell
+    /// prompt answers to, so muscle memory from the command line carries over.
+    fn handle_path_key(&mut self, key: KeyEvent) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Enter => self.action_preview(),
-            KeyCode::Esc => self.focus = Focus::Results,
-            // The field is the first row of a form, so up and down leave it.
-            KeyCode::Up => self.focus = self.focus.step(-1),
-            KeyCode::Down => self.focus = self.focus.step(1),
+            KeyCode::Enter => self.advance(),
+            KeyCode::Esc | KeyCode::Down => self.move_focus(1),
+            KeyCode::Up => self.move_focus(-1),
             KeyCode::Char('a') if control => self.directory.move_home(),
             KeyCode::Char('e') if control => self.directory.move_end(),
             KeyCode::Char('u') if control => {
@@ -639,127 +749,113 @@ impl App {
         }
     }
 
-    /// Everywhere outside the path field, where arrows and their vim twins both
-    /// navigate and single letters act.
+    /// Everywhere outside the path field.
+    ///
+    /// Left and right are the workflow: they walk the wizard the way the step bar
+    /// is drawn. Up and down stay inside the card. Nothing means two things.
     fn handle_command_key(&mut self, key: KeyEvent) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('a') if control => self.tick_all(true),
             KeyCode::Char('r') if control => self.tick_all(false),
-            KeyCode::Char('d') if control => self.navigate(HALF_PAGE),
-            KeyCode::Char('u') if control => self.navigate(-HALF_PAGE),
-            KeyCode::Char('f') if control => self.navigate(PAGE),
-            KeyCode::Char('b') if control => self.navigate(-PAGE),
+            KeyCode::Char('d') if control => self.move_in_list(HALF_PAGE),
+            KeyCode::Char('u') if control => self.move_in_list(-HALF_PAGE),
             KeyCode::Char(_) if control => {}
             KeyCode::Char('p') => self.action_preview(),
             KeyCode::Char('a') => self.action_apply(),
             KeyCode::Char('d') => self.action_demo(),
             KeyCode::Char('o') => self.action_browse(),
-            // The vim way back into the field that esc leaves.
-            KeyCode::Char('i') => self.focus = Focus::Directory,
+            KeyCode::Char('s') => self.show_skipped(),
+            KeyCode::Char('i') => self.focus_on(Control::Path),
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char('q') => self.request_quit(),
-            // A way back to the path field that never risks quitting by accident.
-            KeyCode::Esc => self.focus = Focus::Directory,
-            KeyCode::Char(' ') | KeyCode::Enter => self.activate(),
-            KeyCode::Up | KeyCode::Char('k') => self.navigate(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.navigate(1),
-            KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
-            KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
-            KeyCode::PageUp => self.navigate(-PAGE),
-            KeyCode::PageDown => self.navigate(PAGE),
-            KeyCode::Home | KeyCode::Char('g') => self.navigate(isize::MIN),
-            KeyCode::End | KeyCode::Char('G') => self.navigate(isize::MAX),
+            KeyCode::Esc => self.back(),
+            // Enter always moves the wizard on, whatever holds the keyboard;
+            // space presses the focused control in place. A key that means
+            // "forward" everywhere is worth more than one that means five things.
+            KeyCode::Enter => self.advance(),
+            KeyCode::Char(' ') => self.activate(),
+            KeyCode::Left | KeyCode::Char('h') => self.back(),
+            KeyCode::Right | KeyCode::Char('l') => self.advance(),
+            KeyCode::Up | KeyCode::Char('k') => self.step_within(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.step_within(1),
+            KeyCode::PageUp => self.move_in_list(-PAGE),
+            KeyCode::PageDown => self.move_in_list(PAGE),
+            KeyCode::Home | KeyCode::Char('g') => self.move_in_list(isize::MIN),
+            KeyCode::End | KeyCode::Char('G') => self.move_in_list(isize::MAX),
             _ => {}
         }
     }
 
-    /// Space or Enter on whatever currently holds the keyboard.
+    /// Enter or space on whatever currently holds the keyboard.
     fn activate(&mut self) {
-        match self.focus {
-            Focus::Directory => self.action_preview(),
-            Focus::Recursive => {
+        match self.control() {
+            Some(Control::Path) => self.advance(),
+            Some(Control::Browse) => self.action_browse(),
+            Some(Control::Demo) => self.action_demo(),
+            Some(Control::Level) => self.set_level(MatchLevel::from_index(
+                (self.level.index() + 1) % MatchLevel::ALL.len(),
+            )),
+            Some(Control::Recursive) => {
                 self.recursive = !self.recursive;
                 self.invalidate_preview();
             }
-            Focus::Strict => {
-                self.strict = !self.strict;
-                self.invalidate_preview();
-            }
-            Focus::Level => self.set_level(MatchLevel::from_index(
-                (self.level.index() + 1) % MatchLevel::ALL.len(),
-            )),
-            Focus::Results => self.toggle_highlighted(),
+            Some(Control::List) => self.toggle_highlighted(),
+            Some(Control::Back) => self.back(),
+            Some(Control::Advance) | Some(Control::Again) => self.advance(),
+            None => {}
         }
     }
 
-    /// Up and down: move within a list, or between the setup controls.
-    fn navigate(&mut self, delta: isize) {
-        match self.focus {
-            Focus::Level => self.step_level(delta),
-            Focus::Results => self.move_in_results(delta),
-            _ if delta == 1 || delta == -1 => self.focus = self.focus.step(delta.signum()),
-            // A switch is one row, so first and last mean the ends of the whole
-            // column rather than a nudge to the neighbour.
-            _ => {
-                self.focus = if delta > 0 {
-                    Focus::Results
+    /// Up and down inside the card: through the list, the levels, or the controls.
+    ///
+    /// A group that up and down can never step out of is a trap, so the levels
+    /// and the list both hand the keyboard on at their edges.
+    fn step_within(&mut self, delta: isize) {
+        match self.control() {
+            Some(Control::Level) => {
+                let last = MatchLevel::ALL.len() as isize - 1;
+                let target = self.level.index() as isize + delta;
+                if (0..=last).contains(&target) {
+                    self.set_level(MatchLevel::from_index(target as usize));
                 } else {
-                    Focus::Directory
+                    self.move_focus(delta);
                 }
             }
+            Some(Control::List) => {
+                let at_edge = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| {
+                        let count = preview.prepared.len();
+                        match preview.state.selected() {
+                            None => true,
+                            Some(index) if delta < 0 => index == 0,
+                            Some(index) => index + 1 >= count,
+                        }
+                    })
+                    .unwrap_or(true);
+                if at_edge && delta > 0 {
+                    self.move_focus(delta);
+                } else {
+                    self.move_in_list(delta);
+                }
+            }
+            _ => self.move_focus(delta),
         }
     }
 
-    /// Walk the match levels, leaving the group at either end.
-    ///
-    /// Without that the keyboard is trapped: three radios that up and down can
-    /// never step out of, with only tab as the way on.
-    fn step_level(&mut self, delta: isize) {
-        let last = MatchLevel::ALL.len() as isize - 1;
-        let target = (self.level.index() as isize).saturating_add(delta);
-        // A jump (home, end, a page) stays inside the group; a single step off
-        // the end moves to the neighbouring control.
-        let single_step = delta == 1 || delta == -1;
-        if single_step && !(0..=last).contains(&target) {
-            self.focus = self.focus.step(delta.signum());
+    fn move_focus(&mut self, delta: isize) {
+        let count = self.controls().len() as isize;
+        if count == 0 {
             return;
         }
-        self.set_level(MatchLevel::from_index(target.clamp(0, last) as usize));
+        self.focus = (self.focus as isize + delta).rem_euclid(count) as usize;
     }
 
-    /// Left and right: switch tabs, set a switch, or step through the levels.
-    fn adjust(&mut self, delta: isize) {
-        match self.focus {
-            Focus::Recursive => {
-                let value = delta > 0;
-                if self.recursive != value {
-                    self.recursive = value;
-                    self.invalidate_preview();
-                }
-            }
-            Focus::Strict => {
-                let value = delta > 0;
-                if self.strict != value {
-                    self.strict = value;
-                    self.invalidate_preview();
-                }
-            }
-            // Sideways within the group only: unlike up and down, this never
-            // hands the keyboard to another control.
-            Focus::Level => {
-                let last = MatchLevel::ALL.len() as isize - 1;
-                let target = (self.level.index() as isize + delta.signum()).clamp(0, last);
-                self.set_level(MatchLevel::from_index(target as usize));
-            }
-            Focus::Results => {
-                self.tab = if delta > 0 {
-                    Tab::Skipped
-                } else {
-                    Tab::Matched
-                };
-            }
-            Focus::Directory => {}
+    fn focus_on(&mut self, control: Control) {
+        if let Some(index) = self.controls().iter().position(|item| *item == control) {
+            self.focus = index;
         }
     }
 
@@ -774,7 +870,7 @@ impl App {
     fn request_quit(&mut self) {
         if self.applying {
             self.status = Status::new(
-                "Applying… wait for it to finish before quitting",
+                "Renaming… wait for it to finish before quitting",
                 StatusKind::Working,
             );
         } else {
@@ -782,52 +878,44 @@ impl App {
         }
     }
 
-    fn move_in_results(&mut self, delta: isize) {
-        let tab = self.tab;
+    fn move_in_list(&mut self, delta: isize) {
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
-        match tab {
-            Tab::Matched => {
-                let count = preview.prepared.len();
-                let selected = move_selection(preview.matched_state.selected(), count, delta);
-                preview.matched_state.select(selected);
-            }
-            Tab::Skipped => {
-                let count = preview.plan.skipped.len();
-                let selected = move_selection(preview.skipped_state.selected(), count, delta);
-                preview.skipped_state.select(selected);
-            }
-        }
+        let count = preview.prepared.len();
+        let selected = move_selection(preview.state.selected(), count, delta);
+        preview.state.select(selected);
     }
 
     // ---------------------------------------------------------------------- mouse
 
     /// Movement refreshes the hover point; a left click acts where it lands.
-    ///
-    /// Capture is always on, so these arrive everywhere including over blank
-    /// areas — they simply find no registered rectangle and do nothing.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => self.hover = Some(position),
             MouseEventKind::Down(MouseButton::Left) => self.click(position),
-            MouseEventKind::ScrollUp => self.scroll(-WHEEL, position),
-            MouseEventKind::ScrollDown => self.scroll(WHEEL, position),
+            MouseEventKind::ScrollUp => self.scroll(-WHEEL),
+            MouseEventKind::ScrollDown => self.scroll(WHEEL),
             _ => {}
         }
     }
 
-    /// The wheel moves whatever is under it: the picker, the setup column, or
-    /// the results.
-    fn scroll(&mut self, delta: isize, at: Position) {
+    /// The wheel moves whichever list is on top.
+    fn scroll(&mut self, delta: isize) {
         match self.modal.as_mut() {
             Some(Modal::Picker(picker)) => picker.move_by(delta),
-            Some(_) => {}
-            None if self.setup_area.contains(at) => {
-                self.setup_scroll = self.setup_scroll.saturating_add_signed(delta);
+            Some(Modal::Skipped(state)) => {
+                let count = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| preview.plan.skipped.len())
+                    .unwrap_or(0);
+                let selected = move_selection(state.selected(), count, delta);
+                state.select(selected);
             }
-            None => self.move_in_results(delta),
+            Some(_) => {}
+            None => self.move_in_list(delta),
         }
     }
 
@@ -863,9 +951,10 @@ impl App {
             }
             (Some(Modal::Picker(picker)), Hit::PickerParent) => picker.leave(),
             (Some(Modal::Picker(_)), Hit::PickerUse) => self.use_picker_folder(),
-            (Some(Modal::Picker(_)), Hit::PickerCancel) | (Some(Modal::Help), Hit::HelpClose) => {
-                self.modal = None;
-            }
+            (Some(Modal::Picker(_)), Hit::PickerCancel)
+            | (Some(Modal::Help), Hit::CloseModal)
+            | (Some(Modal::Skipped(_)), Hit::CloseModal) => self.modal = None,
+            (Some(Modal::Skipped(state)), Hit::Row(index)) => state.select(Some(index)),
             (Some(Modal::Confirm { .. }), Hit::ConfirmApply) => {
                 self.modal = None;
                 self.start_apply();
@@ -875,7 +964,7 @@ impl App {
         }
     }
 
-    /// Take the folder the picker is showing as the directory to scan.
+    /// Take the folder the picker is showing as the folder to scan.
     fn use_picker_folder(&mut self) {
         let Some(Modal::Picker(picker)) = &self.modal else {
             return;
@@ -884,48 +973,23 @@ impl App {
         self.modal = None;
         self.directory.set_value(&chosen.to_string_lossy());
         self.invalidate_preview();
-        self.focus = Focus::Directory;
+        self.go_to(Step::Folder);
     }
 
     fn click_main(&mut self, hit: Hit) {
         match hit {
-            Hit::Directory => self.focus = Focus::Directory,
-            Hit::BrowseButton => self.action_browse(),
-            Hit::Recursive => {
-                self.focus = Focus::Recursive;
-                self.recursive = !self.recursive;
-                self.invalidate_preview();
-            }
-            Hit::Strict => {
-                self.focus = Focus::Strict;
-                self.strict = !self.strict;
-                self.invalidate_preview();
-            }
-            Hit::Level(index) => {
-                self.focus = Focus::Level;
+            Hit::Control(control) => self.click_control(control),
+            Hit::LevelRow(index) => {
+                self.focus_on(Control::Level);
                 self.set_level(MatchLevel::from_index(index));
             }
-            Hit::PreviewButton => self.action_preview(),
-            Hit::ApplyButton => self.action_apply(),
-            Hit::DemoButton => self.action_demo(),
-            Hit::HelpButton => self.modal = Some(Modal::Help),
-            Hit::QuitButton => self.request_quit(),
+            Hit::Row(index) => self.click_row(index),
+            Hit::Dot(index) => self.click_dot(index),
+            Hit::Help => self.modal = Some(Modal::Help),
+            Hit::Quit => self.request_quit(),
             Hit::TickAll => self.tick_all(true),
             Hit::TickNone => self.tick_all(false),
-            Hit::Tab(tab) => {
-                self.tab = tab;
-                self.focus = Focus::Results;
-            }
-            Hit::MatchedRow(index) => self.click_matched_row(index),
-            Hit::SkippedRow(index) => {
-                self.focus = Focus::Results;
-                self.tab = Tab::Skipped;
-                if let Some(preview) = self.preview.as_mut() {
-                    if index < preview.plan.skipped.len() {
-                        preview.skipped_state.select(Some(index));
-                    }
-                }
-            }
+            Hit::Skipped => self.show_skipped(),
             // The modals own these variants; reaching one with no modal open
             // means the rectangle outlived the modal, so it is simply ignored.
             Hit::PickerRow(_)
@@ -934,25 +998,40 @@ impl App {
             | Hit::PickerCancel
             | Hit::ConfirmApply
             | Hit::ConfirmCancel
-            | Hit::HelpClose => {}
+            | Hit::CloseModal => {}
+        }
+    }
+
+    fn click_control(&mut self, control: Control) {
+        self.focus_on(control);
+        match control {
+            // The field only takes focus; clicking it must not submit it.
+            Control::Path => {}
+            Control::Browse => self.action_browse(),
+            Control::Demo => self.action_demo(),
+            Control::Recursive => {
+                self.recursive = !self.recursive;
+                self.invalidate_preview();
+            }
+            Control::Level | Control::List => {}
+            Control::Back => self.back(),
+            Control::Advance | Control::Again => self.advance(),
         }
     }
 
     /// First click selects, second click on the same row ticks — the double
     /// click of every list widget, without timing any double click.
-    fn click_matched_row(&mut self, index: usize) {
-        let again = self.focus == Focus::Results
-            && self.tab == Tab::Matched
+    fn click_row(&mut self, index: usize) {
+        let again = self.is_focused(Control::List)
             && self
                 .preview
                 .as_ref()
-                .and_then(|preview| preview.matched_state.selected())
+                .and_then(|preview| preview.state.selected())
                 == Some(index);
-        self.focus = Focus::Results;
-        self.tab = Tab::Matched;
+        self.focus_on(Control::List);
         if let Some(preview) = self.preview.as_mut() {
             if index < preview.prepared.len() {
-                preview.matched_state.select(Some(index));
+                preview.state.select(Some(index));
             }
         }
         if again {
@@ -960,18 +1039,54 @@ impl App {
         }
     }
 
+    /// A dot in the step bar walks back to a step already visited.
+    ///
+    /// Forward is deliberately not clickable: moving on has preconditions, and a
+    /// dot that silently refuses reads as broken. `Advance` is the way forward.
+    fn click_dot(&mut self, index: usize) {
+        if self.busy() || index >= self.step.index() {
+            return;
+        }
+        match Step::ORDER[index] {
+            Step::Folder => self.go_to(Step::Folder),
+            Step::Rules => self.go_to(Step::Rules),
+            _ => {}
+        }
+    }
+
     // -------------------------------------------------------------------- modals
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
+        let skipped_count = self
+            .preview
+            .as_ref()
+            .map(|preview| preview.plan.skipped.len())
+            .unwrap_or(0);
         match self.modal.as_mut() {
             Some(Modal::Help) => {
                 if matches!(
                     key.code,
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q')
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q' | ' ')
                 ) {
                     self.modal = None;
                 }
             }
+            Some(Modal::Skipped(state)) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.select(move_selection(state.selected(), skipped_count, -1))
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.select(move_selection(state.selected(), skipped_count, 1))
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    state.select(move_selection(state.selected(), skipped_count, isize::MIN))
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    state.select(move_selection(state.selected(), skipped_count, isize::MAX))
+                }
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('s' | 'q' | ' ') => self.modal = None,
+                _ => {}
+            },
             Some(Modal::Confirm { .. }) => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
                     self.modal = None;
@@ -1029,10 +1144,11 @@ fn first_error(result: &ApplyResult) -> String {
 mod tests {
     use super::*;
 
-    type ConfigurationChange = (&'static str, fn(&mut App));
+    type RuleChange = (&'static str, fn(&mut App));
 
     fn app_with_queued_scan() -> App {
         let mut app = App::new();
+        app.step = Step::Rules;
         app.generation = 7;
         app.scanning = true;
         app.sender
@@ -1045,30 +1161,26 @@ mod tests {
     }
 
     fn edit_directory(app: &mut App) {
+        app.step = Step::Folder;
+        app.focus = 0;
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
     }
 
     fn toggle_recursive(app: &mut App) {
-        app.focus = Focus::Recursive;
-        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-    }
-
-    fn toggle_strict(app: &mut App) {
-        app.focus = Focus::Strict;
+        app.focus_on(Control::Recursive);
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     }
 
     fn change_level(app: &mut App) {
-        app.focus = Focus::Level;
-        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.focus_on(Control::Level);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     }
 
     #[test]
-    fn configuration_changes_reject_an_in_flight_scan_result() {
-        let changes: [ConfigurationChange; 4] = [
+    fn rule_changes_reject_an_in_flight_scan_result() {
+        let changes: [RuleChange; 3] = [
             ("directory", edit_directory),
             ("recursive", toggle_recursive),
-            ("strict", toggle_strict),
             ("level", change_level),
         ];
 
@@ -1080,7 +1192,33 @@ mod tests {
             app.poll_workers();
             assert!(app.preview.is_none(), "{name} accepted the obsolete plan");
             assert!(!app.can_apply(), "{name} made the obsolete plan applicable");
-            assert_eq!(app.status.text, "Options changed — preview again");
         }
+    }
+
+    #[test]
+    fn the_wizard_walks_both_ways() {
+        let mut app = App::new();
+        assert_eq!(app.step, Step::Folder);
+        // An empty path is not a folder, so the first step refuses to be left.
+        app.advance();
+        assert_eq!(app.step, Step::Folder);
+        assert_eq!(app.status.kind, StatusKind::Error);
+
+        app.directory.set_value(".");
+        app.advance();
+        assert_eq!(app.step, Step::Rules);
+        app.back();
+        assert_eq!(app.step, Step::Folder);
+    }
+
+    #[test]
+    fn a_demo_jumps_to_the_preview_and_can_never_be_applied() {
+        let mut app = App::new();
+        app.action_demo();
+        assert_eq!(app.step, Step::Preview);
+        assert!(!app.can_apply());
+        app.advance();
+        assert!(app.modal.is_none());
+        assert_eq!(app.status.kind, StatusKind::Demo);
     }
 }

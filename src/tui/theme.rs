@@ -93,12 +93,3 @@ pub fn heading() -> Style {
 pub fn key() -> Style {
     Style::default().fg(KEY).add_modifier(Modifier::BOLD)
 }
-
-/// The border of a panel, brightened while it holds the keyboard.
-pub fn border(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(FOCUS)
-    } else {
-        Style::default().fg(BORDER)
-    }
-}
