@@ -6,6 +6,15 @@
 
 use crate::planning::{plan_virtual_files, MatchReason, PlanOptions, RenamePlan, SkipReason};
 
+/// Pick the singular or plural wording for `count`.
+pub fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
+    if count == 1 {
+        one
+    } else {
+        many
+    }
+}
+
 /// How eager the fuzzy matcher should be.
 ///
 /// A named level rather than a raw threshold: `0.72` means nothing to a person,

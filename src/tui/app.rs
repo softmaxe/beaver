@@ -20,9 +20,9 @@ use ratatui::widgets::{ListState, TableState};
 use crate::applying::{
     apply_operations, prepare_operations, ApplyResult, ApplyStatus, PlanChanged, PreparedOperation,
 };
-use crate::paths::display_path;
+use crate::paths::{display_path, file_name};
 use crate::planning::{plan_directory, PlanOptions, RenamePlan};
-use crate::presentation::{demo_plan, MatchLevel};
+use crate::presentation::{demo_plan, plural, MatchLevel};
 use crate::tui::input::TextInput;
 use crate::tui::picker::Picker;
 
@@ -1023,20 +1023,6 @@ fn first_error(result: &ApplyResult) -> String {
         .first()
         .and_then(|outcome| outcome.error.clone())
         .unwrap_or_else(|| "unknown error".into())
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-fn plural(count: usize, one: &str, many: &str) -> String {
-    if count == 1 {
-        one.into()
-    } else {
-        many.into()
-    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,11 @@ impl Harness {
         }
     }
 
+    /// Which matched row holds the caret.
+    fn selected(&self) -> Option<usize> {
+        self.app.preview.as_ref().unwrap().matched_state.selected()
+    }
+
     fn press(&mut self, code: KeyCode) {
         self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
@@ -535,20 +540,11 @@ fn arrows_move_the_highlight_and_space_ticks_the_highlighted_row() {
     harness.press(KeyCode::Enter);
     harness.settle(|app| app.preview.is_some());
 
-    let selected = |harness: &Harness| {
-        harness
-            .app
-            .preview
-            .as_ref()
-            .unwrap()
-            .matched_state
-            .selected()
-    };
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
 
     harness.press(KeyCode::Down);
     harness.draw();
-    assert_eq!(selected(&harness), Some(1));
+    assert_eq!(harness.selected(), Some(1));
     // The detail line spells the highlighted rename out in full.
     let screen = harness.screen();
     assert!(
@@ -560,11 +556,11 @@ fn arrows_move_the_highlight_and_space_ticks_the_highlighted_row() {
 
     // The highlight stops at the last row instead of running off the list.
     harness.press(KeyCode::Down);
-    assert_eq!(selected(&harness), Some(1));
+    assert_eq!(harness.selected(), Some(1));
     harness.press(KeyCode::Home);
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
     harness.press(KeyCode::End);
-    assert_eq!(selected(&harness), Some(1));
+    assert_eq!(harness.selected(), Some(1));
 
     harness.press(KeyCode::Char(' '));
     harness.draw();
@@ -847,29 +843,20 @@ fn vim_letters_move_the_highlight_and_switch_tabs_in_the_results() {
     harness.press(KeyCode::Enter);
     harness.settle(|app| app.preview.is_some());
 
-    let selected = |harness: &Harness| {
-        harness
-            .app
-            .preview
-            .as_ref()
-            .unwrap()
-            .matched_state
-            .selected()
-    };
     assert_eq!(harness.app.focus, Focus::Results);
 
     harness.press(KeyCode::Char('j'));
     harness.draw();
-    assert_eq!(selected(&harness), Some(1));
+    assert_eq!(harness.selected(), Some(1));
     assert!(harness
         .screen()
         .contains("[Group] Nebula Archive - S01E02.chs.ass  →  Nebula.Archive.S01E02.1080p.ass"));
     harness.press(KeyCode::Char('k'));
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
     harness.press(KeyCode::Char('G'));
-    assert_eq!(selected(&harness), Some(1));
+    assert_eq!(harness.selected(), Some(1));
     harness.press(KeyCode::Char('g'));
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
 
     // h and l are the tab keys here, the same as ← and →.
     harness.press(KeyCode::Char('l'));
@@ -889,47 +876,38 @@ fn the_page_keys_jump_by_half_a_screen_and_a_whole_one_and_stop_at_the_ends() {
     harness.press(KeyCode::Enter);
     harness.settle(|app| app.preview.is_some());
 
-    let selected = |harness: &Harness| {
-        harness
-            .app
-            .preview
-            .as_ref()
-            .unwrap()
-            .matched_state
-            .selected()
-    };
     assert!(harness.screen().contains("To rename (14)"));
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
 
     harness.press_control(KeyCode::Char('d'));
     harness.draw();
-    assert_eq!(selected(&harness), Some(5));
+    assert_eq!(harness.selected(), Some(5));
     // Half a page is five rows, and the detail line proves which row that is.
     assert!(harness
         .screen()
         .contains("[G] Harbour - S01E06.chs.ass  →  Harbour.S01E06.ass"));
 
     harness.press_control(KeyCode::Char('u'));
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
 
     harness.press_control(KeyCode::Char('f'));
     harness.draw();
-    assert_eq!(selected(&harness), Some(10));
+    assert_eq!(harness.selected(), Some(10));
     assert!(harness
         .screen()
         .contains("[G] Harbour - S01E11.chs.ass  →  Harbour.S01E11.ass"));
 
     harness.press_control(KeyCode::Char('b'));
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
 
     // Both directions stop at the end of the list instead of running off it.
     harness.press_control(KeyCode::Char('b'));
-    assert_eq!(selected(&harness), Some(0));
+    assert_eq!(harness.selected(), Some(0));
     harness.press_control(KeyCode::Char('f'));
     harness.press_control(KeyCode::Char('f'));
-    assert_eq!(selected(&harness), Some(13));
+    assert_eq!(harness.selected(), Some(13));
     harness.press_control(KeyCode::Char('d'));
-    assert_eq!(selected(&harness), Some(13));
+    assert_eq!(harness.selected(), Some(13));
 }
 
 #[test]

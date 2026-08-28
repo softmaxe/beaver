@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
 
-use crate::paths::display_path;
+use crate::paths::{display_path, file_name};
 use crate::planning::{RenameOp, RenamePlan};
 
 /// A cheap fingerprint of a path, used to spot changes between two points in time.
@@ -228,12 +228,6 @@ fn target_is_occupied(source: &Path, destination: &Path) -> bool {
         // Without inode numbers, compare the resolved paths instead.
         _ => fs::canonicalize(destination).ok() != fs::canonicalize(source).ok(),
     }
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
