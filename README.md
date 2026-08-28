@@ -43,8 +43,7 @@ During development, `cargo run` does the same thing.
 The interface is a wizard: one step is on screen at a time, and a bar of dots across the top says
 where you are.
 
-1. **Folder.** Type or paste a path, press `o` to browse, or press `d` for a demo library that looks
-   real and writes nothing. `Enter` moves on.
+1. **Folder.** Type or paste a path, or press `o` to browse. `Enter` moves on.
 2. **Rules.** Two of them: a match level, and whether subfolders are included. `Enter` starts the
    scan.
 3. **Preview.** Entirely read-only: a ticked count, a checkbox list of proposed renames, and the
@@ -75,7 +74,6 @@ not a separate mode.
 | `i`                  |         | Back into the path field                     |
 | `p`                  |         | Rescan                                       |
 | `a`                  |         | Apply the ticked renames                     |
-| `d`                  |         | Demo library                                 |
 | `o`                  |         | Browse for a folder                          |
 | `?`                  |         | Shortcut list                                |
 | `q`                  |         | Quit                                         |
@@ -155,8 +153,7 @@ Matching is scoped per directory: a subtitle is only ever matched against videos
 
 ## A folder to practise on
 
-Demo mode shows the workflow but never writes anything. To try a real apply on files that do not
-matter, generate a throwaway library:
+To try a real apply on files that do not matter, generate a throwaway library:
 
 ```bash
 scripts/make-demo-library.sh          # creates demo-library/ at the repository root

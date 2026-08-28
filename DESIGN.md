@@ -29,7 +29,6 @@ would double the surface area of "what does this colour mean" for no gain in a t
 | `CERTAIN`              | Teal         | `#94e2d5` | Episode-ID matches                         |
 | `SUCCESS` / `TICK`     | Green        | `#a6e3a1` | Ticked boxes, finished steps, the progress bar, completion |
 | `WORKING`              | Yellow       | `#f9e2af` | A scan or a rename in flight               |
-| `DEMO`                 | Peach        | `#fab387` | Demo mode, which looks real but writes nothing |
 | `ERROR`                | Red          | `#f38ba8` | Errors, refused applies                    |
 
 Mauve and teal are the two colours a user actually learns: **mauve means "this is what the keyboard
@@ -55,10 +54,10 @@ Measured in character cells, not pixels. The smallest supported size is **80 × 
 The screen is a wizard that runs left to right, and only one step of it is ever drawn:
 
 ```
-┌ beaver · subtitles → videos ─────────────────────────── ? help  q quit ┐
+┌ beaver · rename subtitles to match their videos ─────── ? help  q quit ┐
 │                                                                        │
 │              ●───────────●───────────○───────────○                     │
-│              Folder      Rules       Preview     Apply                 │
+│            Folder      Rules      Preview      Apply                   │
 │                                                                        │
 │           ╭ 2 · Rules ──────────────────────────────╮                  │
 │           │   Match level                           │                  │
@@ -95,7 +94,7 @@ floor around it is what separates it from the two bars.
 
 | Step        | Holds                                                                 |
 | ----------- | --------------------------------------------------------------------- |
-| **Folder**  | The path field, a browse button, and the demo library.                |
+| **Folder**  | The path field and a browse button.                                   |
 | **Rules**   | Three match levels and one subfolder switch. Nothing else.            |
 | **Preview** | The proposed renames, a ticked count, and the skipped ones behind `s`. |
 | **Apply**   | A progress bar while it runs, then a tick or a cross and what happened. |

@@ -26,7 +26,7 @@ use crate::applying::{
 };
 use crate::paths::{display_path, file_name};
 use crate::planning::{plan_directory, PlanOptions, RenamePlan};
-use crate::presentation::{demo_plan, plural, MatchLevel};
+use crate::presentation::{plural, MatchLevel};
 use crate::tui::input::TextInput;
 use crate::tui::picker::Picker;
 
@@ -93,7 +93,6 @@ pub enum Control {
     /// The path field.
     Path,
     Browse,
-    Demo,
     /// The three match levels, which behave as one control.
     Level,
     Recursive,
@@ -135,7 +134,6 @@ pub enum StatusKind {
     Ready,
     Working,
     Success,
-    Demo,
     Error,
 }
 
@@ -153,17 +151,16 @@ impl Status {
     }
 }
 
-/// A preview: a plan, the checkboxes over it, and whether it is only a sample.
+/// A preview: a plan and the checkboxes over it.
 pub struct Preview {
     pub plan: RenamePlan,
     pub prepared: Vec<PreparedOperation>,
     pub ticked: Vec<bool>,
     pub state: ListState,
-    pub is_demo: bool,
 }
 
 impl Preview {
-    fn new(plan: RenamePlan, is_demo: bool) -> Self {
+    fn new(plan: RenamePlan) -> Self {
         let prepared = prepare_operations(&plan);
         let mut state = ListState::default();
         if !prepared.is_empty() {
@@ -174,7 +171,6 @@ impl Preview {
             prepared,
             plan,
             state,
-            is_demo,
         }
     }
 
@@ -297,12 +293,7 @@ impl App {
     /// The focusable controls of the step on screen, in top-to-bottom order.
     pub fn controls(&self) -> Vec<Control> {
         match self.step {
-            Step::Folder => vec![
-                Control::Path,
-                Control::Browse,
-                Control::Demo,
-                Control::Advance,
-            ],
+            Step::Folder => vec![Control::Path, Control::Browse, Control::Advance],
             Step::Rules => vec![
                 Control::Level,
                 Control::Recursive,
@@ -332,7 +323,7 @@ impl App {
             && self
                 .preview
                 .as_ref()
-                .is_some_and(|preview| !preview.is_demo && preview.ticked_count() > 0)
+                .is_some_and(|preview| preview.ticked_count() > 0)
     }
 
     // --------------------------------------------------------------- worker results
@@ -383,7 +374,7 @@ impl App {
     fn scan_succeeded(&mut self, plan: RenamePlan) {
         let (videos, subtitles, matched) =
             (plan.video_count, plan.subtitle_count, plan.operations.len());
-        self.preview = Some(Preview::new(plan, false));
+        self.preview = Some(Preview::new(plan));
         self.step = Step::Preview;
         self.focus = 0;
         self.status = if videos == 0 {
@@ -539,19 +530,6 @@ impl App {
         });
     }
 
-    /// Load the sample library, which looks real and writes nothing.
-    pub fn action_demo(&mut self) {
-        if self.busy() {
-            return;
-        }
-        self.invalidate_preview();
-        self.outcome = None;
-        self.preview = Some(Preview::new(demo_plan(), true));
-        self.step = Step::Preview;
-        self.focus = 0;
-        self.status = Status::new("Demo — sample data, nothing is written", StatusKind::Demo);
-    }
-
     pub fn action_apply(&mut self) {
         if self.busy() {
             return;
@@ -560,10 +538,6 @@ impl App {
             self.status = Status::new("Nothing to apply — preview first", StatusKind::Error);
             return;
         };
-        if preview.is_demo {
-            self.status = Status::new("Demo mode never writes to disk", StatusKind::Demo);
-            return;
-        }
         let chosen = preview.chosen();
         if chosen.is_empty() {
             self.status = Status::new("Tick at least one subtitle", StatusKind::Error);
@@ -763,7 +737,6 @@ impl App {
             KeyCode::Char(_) if control => {}
             KeyCode::Char('p') => self.action_preview(),
             KeyCode::Char('a') => self.action_apply(),
-            KeyCode::Char('d') => self.action_demo(),
             KeyCode::Char('o') => self.action_browse(),
             KeyCode::Char('s') => self.show_skipped(),
             KeyCode::Char('i') => self.focus_on(Control::Path),
@@ -792,7 +765,6 @@ impl App {
         match self.control() {
             Some(Control::Path) => self.advance(),
             Some(Control::Browse) => self.action_browse(),
-            Some(Control::Demo) => self.action_demo(),
             Some(Control::Level) => self.set_level(MatchLevel::from_index(
                 (self.level.index() + 1) % MatchLevel::ALL.len(),
             )),
@@ -1008,7 +980,6 @@ impl App {
             // The field only takes focus; clicking it must not submit it.
             Control::Path => {}
             Control::Browse => self.action_browse(),
-            Control::Demo => self.action_demo(),
             Control::Recursive => {
                 self.recursive = !self.recursive;
                 self.invalidate_preview();
@@ -1143,6 +1114,7 @@ fn first_error(result: &ApplyResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::presentation::demo_plan;
 
     type RuleChange = (&'static str, fn(&mut App));
 
@@ -1209,16 +1181,5 @@ mod tests {
         assert_eq!(app.step, Step::Rules);
         app.back();
         assert_eq!(app.step, Step::Folder);
-    }
-
-    #[test]
-    fn a_demo_jumps_to_the_preview_and_can_never_be_applied() {
-        let mut app = App::new();
-        app.action_demo();
-        assert_eq!(app.step, Step::Preview);
-        assert!(!app.can_apply());
-        app.advance();
-        assert!(app.modal.is_none());
-        assert_eq!(app.status.kind, StatusKind::Demo);
     }
 }
