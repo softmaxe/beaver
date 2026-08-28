@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::widgets::ListState;
 
+use crate::paths::sort_key;
 use crate::tui::app::move_selection;
 
 pub struct Picker {
@@ -42,8 +43,7 @@ impl Picker {
                     }
                     self.entries.push(path);
                 }
-                self.entries
-                    .sort_by_key(|path| path.to_string_lossy().to_lowercase());
+                self.entries.sort_by_key(|path| sort_key(path));
             }
             Err(error) => self.error = Some(error.to_string()),
         }

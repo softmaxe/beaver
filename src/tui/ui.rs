@@ -17,7 +17,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::applying::PreparedOperation;
 use crate::paths::display_path;
 use crate::planning::{MatchReason, RenamePlan};
-use crate::presentation::{match_badge, skip_label, MatchLevel};
+use crate::presentation::{match_badge, plural, skip_label, MatchLevel};
 use crate::tui::app::{App, Focus, Hit, Modal, StatusKind, Tab};
 use crate::tui::theme;
 
@@ -71,6 +71,56 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// Whether the pointer rests on `rect`, for the hover tint.
 fn hovered(hover: Option<Position>, rect: Rect) -> bool {
     hover.is_some_and(|point| rect.contains(point))
+}
+
+/// The rectangle a scrolled list paints row `index` into, or `None` when that
+/// row sits outside the visible window.
+///
+/// `header` is how many lines the widget spends above its first data row: zero
+/// for a list, one for a table with a header.
+fn row_rect(
+    area: Rect,
+    header: u16,
+    offset: usize,
+    rows_on_screen: usize,
+    index: usize,
+) -> Option<Rect> {
+    if index < offset || index >= offset + rows_on_screen {
+        return None;
+    }
+    let y = area.y + header + (index - offset) as u16;
+    Some(Rect::new(area.x, y, area.width, 1))
+}
+
+/// Register a clickable rectangle for every row the widget just painted.
+fn register_rows(
+    hits: &mut Vec<(Rect, Hit)>,
+    area: Rect,
+    header: u16,
+    offset: usize,
+    rows_on_screen: usize,
+    count: usize,
+    hit: impl Fn(usize) -> Hit,
+) {
+    for index in offset..count.min(offset + rows_on_screen) {
+        if let Some(row) = row_rect(area, header, offset, rows_on_screen, index) {
+            hits.push((row, hit(index)));
+        }
+    }
+}
+
+/// The style a row carries when the pointer rests on it.
+fn hover_style(
+    hover: Option<Position>,
+    area: Rect,
+    header: u16,
+    offset: usize,
+    rows_on_screen: usize,
+    index: usize,
+) -> Option<Style> {
+    row_rect(area, header, offset, rows_on_screen, index)
+        .filter(|rect| hovered(hover, *rect))
+        .map(|_| Style::default().bg(theme::SELECTION_BACKGROUND))
 }
 
 // ------------------------------------------------------------------ chrome
@@ -259,36 +309,34 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
     )));
     let (text, cursor) = app.directory.view(width.saturating_sub(3));
-    rows.push(SetupRow::input(
-        &text,
-        app.directory.is_empty(),
-        app.focus == Focus::Directory,
-    ));
-    let input_row = rows.len() - 1;
-    rows.push(SetupRow::button(
-        "o",
-        "Browse for a folder",
-        ButtonKind::Neutral,
-        width,
-    ));
-    let browse_button_row = rows.len() - 1;
+    rows.push(
+        SetupRow::input(
+            &text,
+            app.directory.is_empty(),
+            app.focus == Focus::Directory,
+        )
+        .on(Hit::Directory),
+    );
+    rows.push(
+        SetupRow::button("o", "Browse for a folder", ButtonKind::Neutral, width)
+            .on(Hit::BrowseButton),
+    );
     rows.push(SetupRow::blank());
 
     rows.push(SetupRow::text(label_line("Options", false, "", width)));
-    let recursive_row = rows.len();
-    rows.push(SetupRow::switch(
-        app.recursive,
-        "Include subfolders",
-        app.focus == Focus::Recursive,
-        width,
-    ));
-    let strict_row = rows.len();
-    rows.push(SetupRow::switch(
-        app.strict,
-        "Strict mode",
-        app.focus == Focus::Strict,
-        width,
-    ));
+    rows.push(
+        SetupRow::switch(
+            app.recursive,
+            "Include subfolders",
+            app.focus == Focus::Recursive,
+            width,
+        )
+        .on(Hit::Recursive),
+    );
+    rows.push(
+        SetupRow::switch(app.strict, "Strict mode", app.focus == Focus::Strict, width)
+            .on(Hit::Strict),
+    );
     for line in wrap(
         "Only accept subtitles that fit VideoName+ext exactly",
         width,
@@ -303,15 +351,16 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
         "↑↓",
         width,
     )));
-    let mut level_rows = Vec::new();
-    for level in MatchLevel::ALL {
-        level_rows.push(rows.len());
-        rows.push(SetupRow::radio(
-            level == app.level,
-            level.label(),
-            app.focus == Focus::Level,
-            width,
-        ));
+    for (index, level) in MatchLevel::ALL.into_iter().enumerate() {
+        rows.push(
+            SetupRow::radio(
+                level == app.level,
+                level.label(),
+                app.focus == Focus::Level,
+                width,
+            )
+            .on(Hit::Level(index)),
+        );
     }
     for line in wrap(app.level.hint(), width) {
         rows.push(SetupRow::text(hint_line(&line)));
@@ -320,40 +369,40 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // A blank row between the three keeps them reading as separate buttons
     // rather than one striped block.
-    rows.push(SetupRow::button("p", "Preview", ButtonKind::Primary, width));
-    let preview_button_row = rows.len() - 1;
+    rows.push(SetupRow::button("p", "Preview", ButtonKind::Primary, width).on(Hit::PreviewButton));
     rows.push(SetupRow::blank());
-    rows.push(SetupRow::button(
-        "a",
-        "Apply renames",
-        if app.can_apply() {
-            ButtonKind::Confirm
-        } else {
-            ButtonKind::Disabled
-        },
-        width,
-    ));
-    let apply_button_row = rows.len() - 1;
+    rows.push(
+        SetupRow::button(
+            "a",
+            "Apply renames",
+            if app.can_apply() {
+                ButtonKind::Confirm
+            } else {
+                ButtonKind::Disabled
+            },
+            width,
+        )
+        .on(Hit::ApplyButton),
+    );
     rows.push(SetupRow::blank());
-    rows.push(SetupRow::button(
-        "d",
-        "Demo mode",
-        ButtonKind::Neutral,
-        width,
-    ));
-    let demo_button_row = rows.len() - 1;
+    rows.push(SetupRow::button("d", "Demo mode", ButtonKind::Neutral, width).on(Hit::DemoButton));
 
     // Taking the keyboard drags the column to whatever now holds it; between
     // those moves the wheel is free to put it anywhere, which is the only way a
     // pointer can reach the buttons in a short terminal.
+    let row_of = |hit: Hit| {
+        rows.iter()
+            .position(|row| row.hit == Some(hit))
+            .unwrap_or_default()
+    };
     let height = inner.height as usize;
     if app.setup_focus != app.focus {
         app.setup_focus = app.focus;
         let focus_row = match app.focus {
-            Focus::Directory => input_row,
-            Focus::Recursive => recursive_row,
-            Focus::Strict => strict_row,
-            Focus::Level => level_rows[app.level.index()],
+            Focus::Directory => row_of(Hit::Directory),
+            Focus::Recursive => row_of(Hit::Recursive),
+            Focus::Strict => row_of(Hit::Strict),
+            Focus::Level => row_of(Hit::Level(app.level.index())),
             Focus::Results => 0,
         };
         app.setup_scroll = focus_row.saturating_sub(height.saturating_sub(1));
@@ -369,26 +418,7 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
             inner.width.saturating_sub(2 * row.inset),
             1,
         );
-        // Every control row answers a click; hint and heading rows do not.
-        let hit = if offset == input_row {
-            Some(Hit::Directory)
-        } else if offset == browse_button_row {
-            Some(Hit::BrowseButton)
-        } else if offset == recursive_row {
-            Some(Hit::Recursive)
-        } else if offset == strict_row {
-            Some(Hit::Strict)
-        } else if let Some(level) = level_rows.iter().position(|row| *row == offset) {
-            Some(Hit::Level(level))
-        } else if offset == preview_button_row {
-            Some(Hit::PreviewButton)
-        } else if offset == apply_button_row {
-            Some(Hit::ApplyButton)
-        } else if offset == demo_button_row {
-            Some(Hit::DemoButton)
-        } else {
-            None
-        };
+        let hit = row.hit;
         let mut style = row.style;
         if let Some(hit) = hit {
             app.hits.push((line_area, hit));
@@ -412,7 +442,7 @@ fn draw_setup(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(row.line.clone()).style(style),
             Rect::new(inner.x, y, inner.width, 1),
         );
-        if offset == input_row && app.focus == Focus::Directory {
+        if hit == Some(Hit::Directory) && app.focus == Focus::Directory {
             let column = inner.x + 2 + cursor as u16;
             frame.set_cursor_position((column.min(inner.right().saturating_sub(1)), y));
         }
@@ -425,6 +455,16 @@ struct SetupRow {
     style: Style,
     /// Columns the clickable area is held in from either edge of the column.
     inset: u16,
+    /// The click this row answers. Hint and heading rows answer none.
+    hit: Option<Hit>,
+}
+
+impl SetupRow {
+    /// Mark this row as the clickable target for `hit`.
+    fn on(mut self, hit: Hit) -> Self {
+        self.hit = Some(hit);
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -479,6 +519,7 @@ impl SetupRow {
             line,
             style: Style::default().bg(theme::SURFACE),
             inset: 0,
+            hit: None,
         }
     }
 
@@ -503,6 +544,7 @@ impl SetupRow {
                 theme::PANEL
             }),
             inset: 0,
+            hit: None,
         }
     }
 
@@ -558,6 +600,7 @@ impl SetupRow {
                 theme::SURFACE
             }),
             inset: 0,
+            hit: None,
         }
     }
 
@@ -584,6 +627,7 @@ impl SetupRow {
             line: Line::from(spans),
             style: Style::default().bg(theme::SURFACE),
             inset: BUTTON_MARGIN as u16,
+            hit: None,
         }
     }
 }
@@ -784,7 +828,7 @@ fn draw_summary(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn count_span(count: usize, one: &str, many: &str, colour: Color) -> Span<'static> {
-    let word = if count == 1 { one } else { many };
+    let word = plural(count, one, many);
     Span::styled(format!("{count} {word}"), Style::default().fg(colour))
 }
 
@@ -804,7 +848,7 @@ fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
     // rendered, so it works off the offset of the previous frame; a frame that
     // scrolls redraws immediately anyway.
     let count = preview.prepared.len();
-    let assumed_offset = preview.matched_state.offset().min(count.saturating_sub(1));
+    let assumed_offset = preview.matched_state.offset();
     let rows_on_screen = area.height as usize;
     let items: Vec<ListItem> = preview
         .prepared
@@ -812,22 +856,11 @@ fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
         .zip(&preview.ticked)
         .enumerate()
         .map(|(index, (prepared, ticked))| {
-            let mut item = ListItem::new(operation_line(prepared, *ticked, &preview.plan, width));
-            if index >= assumed_offset
-                && index < assumed_offset + rows_on_screen
-                && hovered(
-                    app.hover,
-                    Rect::new(
-                        area.x,
-                        area.y + (index - assumed_offset) as u16,
-                        area.width,
-                        1,
-                    ),
-                )
-            {
-                item = item.style(Style::default().bg(theme::SELECTION_BACKGROUND));
+            let item = ListItem::new(operation_line(prepared, *ticked, &preview.plan, width));
+            match hover_style(app.hover, area, 0, assumed_offset, rows_on_screen, index) {
+                Some(style) => item.style(style),
+                None => item,
             }
-            item
         })
         .collect();
     let list = List::new(items).highlight_symbol(CARET).highlight_style(
@@ -838,17 +871,15 @@ fn draw_matched(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut preview.matched_state);
 
     // Register from the offset as rendered, so clicks land on what is shown.
-    for index in
-        preview.matched_state.offset()..count.min(preview.matched_state.offset() + rows_on_screen)
-    {
-        let row = Rect::new(
-            area.x,
-            area.y + (index - preview.matched_state.offset()) as u16,
-            area.width,
-            1,
-        );
-        app.hits.push((row, Hit::MatchedRow(index)));
-    }
+    register_rows(
+        &mut app.hits,
+        area,
+        0,
+        preview.matched_state.offset(),
+        rows_on_screen,
+        count,
+        Hit::MatchedRow,
+    );
 }
 
 /// `[✓] source → target        badge`, with the badge pushed to the right.
@@ -912,26 +943,15 @@ fn draw_skipped(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(index, skipped)| {
-            let mut row = Row::new(vec![
+            let row = Row::new(vec![
                 Cell::from(display_path(&skipped.path, &root))
                     .style(Style::default().fg(theme::FOREGROUND)),
                 Cell::from(skip_label(&skipped.reason)).style(theme::muted()),
             ]);
-            if index >= assumed_offset
-                && index < assumed_offset + rows_on_screen
-                && hovered(
-                    app.hover,
-                    Rect::new(
-                        area.x,
-                        area.y + 1 + (index - assumed_offset) as u16,
-                        area.width,
-                        1,
-                    ),
-                )
-            {
-                row = row.style(Style::default().bg(theme::SELECTION_BACKGROUND));
+            match hover_style(app.hover, area, 1, assumed_offset, rows_on_screen, index) {
+                Some(style) => row.style(style),
+                None => row,
             }
-            row
         })
         .collect();
     let table = Table::new(
@@ -943,17 +963,15 @@ fn draw_skipped(frame: &mut Frame, app: &mut App, area: Rect) {
     .row_highlight_style(Style::default().bg(theme::SELECTION_BACKGROUND));
     frame.render_stateful_widget(table, area, &mut preview.skipped_state);
 
-    for index in
-        preview.skipped_state.offset()..count.min(preview.skipped_state.offset() + rows_on_screen)
-    {
-        let row = Rect::new(
-            area.x,
-            area.y + 1 + (index - preview.skipped_state.offset()) as u16,
-            area.width,
-            1,
-        );
-        app.hits.push((row, Hit::SkippedRow(index)));
-    }
+    register_rows(
+        &mut app.hits,
+        area,
+        1,
+        preview.skipped_state.offset(),
+        rows_on_screen,
+        count,
+        Hit::SkippedRow,
+    );
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
@@ -1058,7 +1076,7 @@ fn draw_confirm(
         Line::from(Span::styled(
             format!(
                 "About to rename {count} subtitle {}.",
-                if count == 1 { "file" } else { "files" }
+                plural(count, "file", "files")
             ),
             Style::default().fg(theme::FOREGROUND),
         )),
@@ -1181,25 +1199,14 @@ fn draw_picker(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let mut item = ListItem::new(Line::from(vec![
+            let item = ListItem::new(Line::from(vec![
                 Span::styled("📁 ", theme::faint()),
                 Span::styled(name, Style::default().fg(theme::FOREGROUND)),
             ]));
-            if index >= assumed_offset
-                && index < assumed_offset + rows_on_screen
-                && hovered(
-                    hover,
-                    Rect::new(
-                        list_area.x,
-                        list_area.y + (index - assumed_offset) as u16,
-                        list_area.width,
-                        1,
-                    ),
-                )
-            {
-                item = item.style(Style::default().bg(theme::SELECTION_BACKGROUND));
+            match hover_style(hover, list_area, 0, assumed_offset, rows_on_screen, index) {
+                Some(style) => item.style(style),
+                None => item,
             }
-            item
         })
         .collect();
     let list = List::new(items).highlight_style(
@@ -1209,15 +1216,15 @@ fn draw_picker(
     );
     frame.render_stateful_widget(list, list_area, &mut picker.state);
 
-    for index in picker.state.offset()..count.min(picker.state.offset() + rows_on_screen) {
-        let row = Rect::new(
-            list_area.x,
-            list_area.y + (index - picker.state.offset()) as u16,
-            list_area.width,
-            1,
-        );
-        hits.push((row, Hit::PickerRow(index)));
-    }
+    register_rows(
+        hits,
+        list_area,
+        0,
+        picker.state.offset(),
+        rows_on_screen,
+        count,
+        Hit::PickerRow,
+    );
 }
 
 fn render_dialog(

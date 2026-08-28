@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 
 use crate::applying::{apply_operations, prepare_operations};
-use crate::paths::display_path;
+use crate::paths::{display_path, file_name};
 use crate::planning::{plan_directory, PlanOptions, RenameOp, RenamePlan};
 use crate::presentation::{match_badge, skip_label, MatchLevel};
 
@@ -238,12 +238,6 @@ fn relative_directory(directory: &Path, root: &Path) -> String {
         return ".".into();
     }
     display_path(directory, root)
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 fn confirm(count: usize) -> bool {

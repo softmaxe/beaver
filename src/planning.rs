@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::names::{episode_key, language_tag, normalize_stem};
+use crate::paths::sort_key;
 use crate::similarity::ratio;
 
 pub const VIDEO_EXTS_DEFAULT: &[&str] = &["mkv", "mp4", "avi", "mov", "wmv", "m4v", "webm"];
@@ -157,18 +158,17 @@ impl Candidate {
     }
 }
 
-/// Sort key that keeps output stable regardless of directory iteration order.
-fn sort_key(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase()
-}
-
-/// Plan the renames for a real directory on disk. Reads, never writes.
-pub fn plan_directory(root: &Path, options: &PlanOptions) -> Result<RenamePlan, PlanError> {
-    let root = crate::paths::resolve(root);
-    if !root.is_dir() {
-        return Err(PlanError::NotADirectory(root));
-    }
-
+/// Split `paths` into the video and subtitle candidates of each directory,
+/// keyed by the directory they live in. Anything with an unrecognised extension
+/// is dropped.
+fn classify(
+    paths: Vec<PathBuf>,
+    root: &Path,
+    options: &PlanOptions,
+) -> (
+    HashMap<PathBuf, Vec<Candidate>>,
+    HashMap<PathBuf, Vec<Candidate>>,
+) {
     let video_exts: HashSet<String> = options
         .video_exts
         .iter()
@@ -180,27 +180,35 @@ pub fn plan_directory(root: &Path, options: &PlanOptions) -> Result<RenamePlan, 
         .map(|e| normalize_extension(e))
         .collect();
 
-    let mut videos_by_directory: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-    let mut subtitles_by_directory: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-
-    for path in collect_files(&root, options.recursive)? {
+    let mut videos: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
+    let mut subtitles: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
+    for path in paths {
         let Some(extension) = path.extension() else {
             continue;
         };
         let extension = extension.to_string_lossy().to_lowercase();
-        let parent = path.parent().unwrap_or(&root).to_path_buf();
-        if video_exts.contains(&extension) {
-            videos_by_directory
-                .entry(parent)
-                .or_default()
-                .push(Candidate::new(path));
+        let parent = path.parent().unwrap_or(root).to_path_buf();
+        let bucket = if video_exts.contains(&extension) {
+            &mut videos
         } else if sub_exts.contains(&extension) {
-            subtitles_by_directory
-                .entry(parent)
-                .or_default()
-                .push(Candidate::new(path));
-        }
+            &mut subtitles
+        } else {
+            continue;
+        };
+        bucket.entry(parent).or_default().push(Candidate::new(path));
     }
+    (videos, subtitles)
+}
+
+/// Plan the renames for a real directory on disk. Reads, never writes.
+pub fn plan_directory(root: &Path, options: &PlanOptions) -> Result<RenamePlan, PlanError> {
+    let root = crate::paths::resolve(root);
+    if !root.is_dir() {
+        return Err(PlanError::NotADirectory(root));
+    }
+
+    let (videos_by_directory, subtitles_by_directory) =
+        classify(collect_files(&root, options.recursive)?, &root, options);
 
     Ok(create_plan(
         root,
@@ -217,41 +225,9 @@ pub fn plan_directory(root: &Path, options: &PlanOptions) -> Result<RenamePlan, 
 /// answered from the listing itself.
 pub fn plan_virtual_files(file_names: &[&str], options: &PlanOptions) -> RenamePlan {
     let root = PathBuf::from("/virtual-subtitle-library");
-    let video_exts: HashSet<String> = options
-        .video_exts
-        .iter()
-        .map(|e| normalize_extension(e))
-        .collect();
-    let sub_exts: HashSet<String> = options
-        .sub_exts
-        .iter()
-        .map(|e| normalize_extension(e))
-        .collect();
-
-    let mut videos_by_directory: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-    let mut subtitles_by_directory: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-    let mut existing: HashSet<PathBuf> = HashSet::new();
-
-    for name in file_names {
-        let path = root.join(name);
-        existing.insert(path.clone());
-        let Some(extension) = path.extension() else {
-            continue;
-        };
-        let extension = extension.to_string_lossy().to_lowercase();
-        let parent = path.parent().unwrap_or(&root).to_path_buf();
-        if video_exts.contains(&extension) {
-            videos_by_directory
-                .entry(parent)
-                .or_default()
-                .push(Candidate::new(path));
-        } else if sub_exts.contains(&extension) {
-            subtitles_by_directory
-                .entry(parent)
-                .or_default()
-                .push(Candidate::new(path));
-        }
-    }
+    let paths: Vec<PathBuf> = file_names.iter().map(|name| root.join(name)).collect();
+    let existing: HashSet<PathBuf> = paths.iter().cloned().collect();
+    let (videos_by_directory, subtitles_by_directory) = classify(paths, &root, options);
 
     create_plan(
         root,

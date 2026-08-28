@@ -39,6 +39,19 @@ pub fn display_path(path: &Path, root: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
+/// The file name as a `String`, falling back to the whole path when there is
+/// none (a root, or a path ending in `..`).
+pub fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Sort key that keeps output stable regardless of directory iteration order.
+pub fn sort_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
