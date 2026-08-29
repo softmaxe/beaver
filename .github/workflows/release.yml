@@ -1,0 +1,239 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate release tag
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must match vX.Y.Z: $tag" >&2
+            exit 1
+          fi
+
+          package_version="$(awk '
+            /^\[package\]$/ { in_package = 1; next }
+            /^\[/ { in_package = 0 }
+            in_package && /^version = "/ {
+              value = $0
+              sub(/^version = "/, "", value)
+              sub(/"[[:space:]]*$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.toml)"
+          tag_version="${tag#v}"
+
+          if [[ -z "$package_version" ]]; then
+            echo "Could not read package.version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag version $tag_version does not match Cargo.toml package.version $package_version" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive_extension: tar.gz
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_extension: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_extension: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive_extension: tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive_extension: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive_extension: zip
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust 1.88.0 and target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+          rustup target add --toolchain 1.88.0 "${{ matrix.target }}"
+          rustup show active-toolchain
+
+      - name: Run tests
+        shell: bash
+        run: cargo +1.88.0 test --locked
+
+      - name: Build release binary
+        shell: bash
+        run: cargo +1.88.0 build --release --locked --target "${{ matrix.target }}"
+
+      - name: Set package metadata
+        id: package_metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(awk '
+            /^\[package\]$/ { in_package = 1; next }
+            /^\[/ { in_package = 0 }
+            in_package && /^version = "/ {
+              value = $0
+              sub(/^version = "/, "", value)
+              sub(/"[[:space:]]*$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.toml)"
+          if [[ -z "$package_version" ]]; then
+            echo "Could not read package.version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$package_version"
+          fi
+          package_name="beaver-v${version}-${{ matrix.target }}"
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.package_metadata.outputs.package_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          staging_root="$RUNNER_TEMP/beaver-package"
+          package_dir="$staging_root/$PACKAGE_NAME"
+          archive_path="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME.tar.gz"
+          rm -rf "$staging_root"
+          mkdir -p "$package_dir" "${archive_path%/*}"
+          cp "target/$TARGET/release/beaver" "$package_dir/beaver"
+          cp README.md README.zh-CN.md LICENSE "$package_dir/"
+          tar -C "$staging_root" -czf "$archive_path" "$PACKAGE_NAME"
+
+          for file in beaver README.md README.zh-CN.md LICENSE; do
+            tar -tzf "$archive_path" | grep -Fx "$PACKAGE_NAME/$file" >/dev/null
+          done
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PACKAGE_NAME: ${{ steps.package_metadata.outputs.package_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stagingRoot = Join-Path $env:RUNNER_TEMP 'beaver-package'
+          $packageDir = Join-Path $stagingRoot $env:PACKAGE_NAME
+          $distDir = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $archivePath = Join-Path $distDir ($env:PACKAGE_NAME + '.zip')
+          if (Test-Path $stagingRoot) {
+            Remove-Item -Recurse -Force $stagingRoot
+          }
+          New-Item -ItemType Directory -Force -Path $packageDir, $distDir | Out-Null
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE ("target\{0}\release\beaver.exe" -f $env:TARGET)) (Join-Path $packageDir 'beaver.exe')
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'README.md'), (Join-Path $env:GITHUB_WORKSPACE 'README.zh-CN.md'), (Join-Path $env:GITHUB_WORKSPACE 'LICENSE') $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $archivePath -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+          try {
+            $expected = @(
+              "$($env:PACKAGE_NAME)/beaver.exe",
+              "$($env:PACKAGE_NAME)/README.md",
+              "$($env:PACKAGE_NAME)/README.zh-CN.md",
+              "$($env:PACKAGE_NAME)/LICENSE"
+            )
+            foreach ($file in $expected) {
+              if (-not ($zip.Entries.FullName -contains $file)) {
+                throw "Archive is missing $file"
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package_metadata.outputs.package_name }}
+          path: dist/${{ steps.package_metadata.outputs.package_name }}.${{ matrix.archive_extension }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: beaver-v*-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(beaver-v*.tar.gz beaver-v*.zip)
+          if [[ "${#archives[@]}" -ne 6 ]]; then
+            echo "Expected six release archives, found ${#archives[@]}" >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" | sort -k2 > SHA256SUMS
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            --notes "WARNING: These release binaries are unsigned. macOS Gatekeeper and Windows SmartScreen may warn when you open them." \
+            dist/*
