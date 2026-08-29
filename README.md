@@ -107,9 +107,41 @@ that field, `Ctrl+A` and `Ctrl+E` move to the start and end, `Ctrl+U` clears the
 deletes the tail, and `Ctrl+W` or `Alt+Backspace` deletes the previous path segment. `Tab`, `Esc`,
 or `↓` leaves the field. `Enter` moves on.
 
-## Installation and running
+## Installation
 
-Rust 1.88 or newer is required.
+### Homebrew
+
+For macOS and Linux, the easiest way is Homebrew:
+
+```bash
+brew tap softmaxe/tap
+brew install beaver
+```
+
+This pulls the prebuilt archive from the GitHub release. You do not need Rust installed.
+
+Keep it up to date with:
+
+```bash
+brew update
+brew upgrade beaver
+```
+
+You can also install without tapping first:
+
+```bash
+brew install softmaxe/tap/beaver
+```
+
+Check that it works:
+
+```bash
+beaver --help
+```
+
+### From source
+
+You need Rust 1.88 or newer.
 
 Build a release binary:
 
@@ -123,15 +155,14 @@ The binary is `target/release/beaver`. Install it on your `PATH` with:
 cargo install --path .
 ```
 
-Then start the TUI with either command:
+Then start the TUI:
 
 ```bash
 beaver
 beaver --tui /path/to/library
 ```
 
-For a checkout-local run, use `cargo run --` before the same arguments, for example
-`cargo run -- --tui /path/to/library`.
+To run without installing, put `cargo run --` before the same arguments. For example `cargo run -- --tui /path/to/library`.
 
 ## CLI
 

@@ -104,7 +104,39 @@ TUI 固定使用 strict 行为。目标文件名被占用时不会悄悄添加�
 移动到开头和末尾，`Ctrl+U` 清空整行，`Ctrl+K` 删除光标后的内容，`Ctrl+W` 或
 `Alt+Backspace` 删除上一个路径片段。`Tab`、`Esc` 或 `↓` 离开输入框，`Enter` 继续。
 
-## 安装与运行
+## 安装
+
+### Homebrew
+
+macOS 和 Linux 可以直接用 Homebrew：
+
+```bash
+brew tap softmaxe/tap
+brew install beaver
+```
+
+这会从 GitHub release 下载预编译的压缩包，不需要本机装 Rust。
+
+更新：
+
+```bash
+brew update
+brew upgrade beaver
+```
+
+也可以不先 tap：
+
+```bash
+brew install softmaxe/tap/beaver
+```
+
+验证：
+
+```bash
+beaver --help
+```
+
+### 从源码安装
 
 需要 Rust 1.88 或更高版本。
 
@@ -114,21 +146,20 @@ TUI 固定使用 strict 行为。目标文件名被占用时不会悄悄添加�
 cargo build --release
 ```
 
-生成的 binary 位于 `target/release/beaver`。要安装到 `PATH`：
+产物在 `target/release/beaver`。安装到 `PATH`：
 
 ```bash
 cargo install --path .
 ```
 
-安装后可用下面任一命令启动 TUI：
+启动 TUI：
 
 ```bash
 beaver
 beaver --tui /path/to/library
 ```
 
-在当前 checkout 中直接运行时，把相同参数放在 `cargo run --` 后面，例如
-`cargo run -- --tui /path/to/library`。
+不安装直接运行，把参数放在 `cargo run --` 后面即可，例如 `cargo run -- --tui /path/to/library`。
 
 ## CLI
 
