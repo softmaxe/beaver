@@ -1,15 +1,15 @@
 <p align="center">
-  <a href="./README.md"><kbd>English</kbd></a>
-  <a href="./README.zh-CN.md"><kbd>简体中文</kbd></a>
-</p>
-
-<p align="center">
-  <img src="./docs/assets/beaver-logo.png" alt="beaver logo" width="144">
+  <img src="./docs/assets/beaver-logo.png" alt="beaver logo" width="180">
 </p>
 
 <h1 align="center">beaver</h1>
 
-<p align="center">让字幕文件名跟随同目录的视频文件。</p>
+<p align="center">
+  <a href="README.md"><kbd>English</kbd></a>
+  <a href="README.zh-CN.md"><kbd>简体中文</kbd></a>
+</p>
+
+让字幕文件名跟随同目录的视频文件。
 
 <p align="center">
   <img src="./docs/assets/beaver-demo.gif" alt="beaver 终端界面演示" width="720">
