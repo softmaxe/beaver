@@ -19,10 +19,6 @@ impl TextInput {
         self.characters.iter().collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.characters.is_empty()
-    }
-
     pub fn set_value(&mut self, value: &str) {
         self.characters = value.chars().collect();
         self.cursor = self.characters.len();

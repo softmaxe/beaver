@@ -16,6 +16,9 @@ use crate::similarity::ratio;
 
 pub const VIDEO_EXTS_DEFAULT: &[&str] = &["mkv", "mp4", "avi", "mov", "wmv", "m4v", "webm"];
 pub const SUB_EXTS_DEFAULT: &[&str] = &["ass", "srt", "ssa", "vtt", "sub"];
+pub(crate) const RELAXED_MIN_SCORE: f64 = 0.60;
+pub(crate) const BALANCED_MIN_SCORE: f64 = 0.72;
+pub(crate) const CAUTIOUS_MIN_SCORE: f64 = 0.84;
 
 /// How far ahead of the runner-up the best fuzzy match has to be.
 ///
@@ -94,7 +97,7 @@ impl Default for PlanOptions {
             recursive: false,
             strict: false,
             overwrite_existing: false,
-            min_score: crate::presentation::MatchLevel::default().score(),
+            min_score: BALANCED_MIN_SCORE,
             video_exts: VIDEO_EXTS_DEFAULT
                 .iter()
                 .map(|ext| ext.to_string())
@@ -260,6 +263,7 @@ fn collect_files(root: &Path, recursive: bool) -> std::io::Result<Vec<PathBuf>> 
                         directories.push(path);
                     }
                 }
+                Ok(file_type) if file_type.is_file() => files.push(path),
                 // Follows symlinks, so a link to a video counts as one.
                 _ if path.is_file() => files.push(path),
                 _ => {}
@@ -280,7 +284,7 @@ fn create_plan(
         .values_mut()
         .chain(subtitles_by_directory.values_mut())
     {
-        candidates.sort_by_key(|candidate| sort_key(&candidate.path));
+        candidates.sort_by_cached_key(|candidate| sort_key(&candidate.path));
     }
 
     let mut directories: Vec<PathBuf> = videos_by_directory
@@ -290,7 +294,7 @@ fn create_plan(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    directories.sort_by_key(|directory| sort_key(directory));
+    directories.sort_by_cached_key(|directory| sort_key(directory));
 
     let video_count = videos_by_directory.values().map(Vec::len).sum();
     let subtitle_count = subtitles_by_directory.values().map(Vec::len).sum();
@@ -298,14 +302,16 @@ fn create_plan(
 
     let mut operations = Vec::new();
     let mut skipped = Vec::new();
-    let empty: Vec<Candidate> = Vec::new();
-
     for directory in &directories {
-        let subtitles = subtitles_by_directory.get(directory).unwrap_or(&empty);
+        let subtitles = subtitles_by_directory
+            .get(directory)
+            .map_or(&[][..], Vec::as_slice);
         if subtitles.is_empty() {
             continue;
         }
-        let videos = videos_by_directory.get(directory).unwrap_or(&empty);
+        let videos = videos_by_directory
+            .get(directory)
+            .map_or(&[][..], Vec::as_slice);
         if videos.is_empty() {
             skipped.extend(subtitles.iter().map(|subtitle| SkippedRename {
                 path: subtitle.path.clone(),
@@ -450,16 +456,17 @@ fn choose_destination(
     let directory = video.path.parent()?;
     let video_stem = video.path.file_stem()?.to_string_lossy().into_owned();
 
-    let base = directory.join(format!("{video_stem}.{extension}"));
     // Renaming a file onto its own name is not a collision; the caller reports
     // that case as "already matches".
-    if base == subtitle.path {
-        return Some(base);
-    }
     let taken = |candidate: &Path| {
         planned.contains(candidate) || (!overwrite_existing && path_exists(candidate))
     };
-    if !taken(&base) {
+    let available = |candidate: PathBuf| {
+        (candidate == subtitle.path || !taken(&candidate)).then_some(candidate)
+    };
+
+    let base = directory.join(format!("{video_stem}.{extension}"));
+    if let Some(base) = available(base) {
         return Some(base);
     }
     if strict {
@@ -468,10 +475,7 @@ fn choose_destination(
 
     if let Some(tag) = language_tag(&subtitle.path.file_stem()?.to_string_lossy()) {
         let tagged = directory.join(format!("{video_stem}.{tag}.{extension}"));
-        if tagged == subtitle.path {
-            return Some(tagged);
-        }
-        if !taken(&tagged) {
+        if let Some(tagged) = available(tagged) {
             return Some(tagged);
         }
     }
@@ -479,10 +483,7 @@ fn choose_destination(
     // Bounded so a pathological directory cannot spin here forever.
     for number in 2..1000 {
         let numbered = directory.join(format!("{video_stem}.{number}.{extension}"));
-        if numbered == subtitle.path {
-            return Some(numbered);
-        }
-        if !taken(&numbered) {
+        if let Some(numbered) = available(numbered) {
             return Some(numbered);
         }
     }
@@ -502,21 +503,27 @@ fn choose_unique_best<'a>(
         return (None, 0.0);
     }
 
-    let mut scored: Vec<(f64, &Candidate)> = videos
-        .iter()
-        .filter(|video| !video.stem_norm.is_empty())
-        .map(|video| (ratio(&subtitle.stem_norm, &video.stem_norm), video))
-        .collect();
-    // Stable, so equal scores keep directory order and the choice is repeatable.
-    scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let mut best = None;
+    let mut runner_up = 0.0;
+    for video in videos.iter().filter(|video| !video.stem_norm.is_empty()) {
+        let score = ratio(&subtitle.stem_norm, &video.stem_norm);
+        match best {
+            Some((best_score, _)) if score > best_score => {
+                runner_up = best_score;
+                best = Some((score, video));
+            }
+            Some(_) if score > runner_up => runner_up = score,
+            None => best = Some((score, video)),
+            _ => {}
+        }
+    }
 
-    let Some(&(best_score, best)) = scored.first() else {
+    let Some((best_score, best)) = best else {
         return (None, 0.0);
     };
     if best_score < min_score {
         return (None, best_score);
     }
-    let runner_up = scored.get(1).map_or(0.0, |entry| entry.0);
     if best_score - runner_up < MIN_SCORE_MARGIN {
         return (None, best_score);
     }

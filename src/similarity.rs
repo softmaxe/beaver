@@ -81,9 +81,10 @@ impl<'a> SequenceMatcher<'a> {
         let (mut best_i, mut best_j, mut best_size) = (a_low, b_low, 0usize);
         // Length of the run ending at each position of `b`, for the previous `i`.
         let mut run_lengths: HashMap<usize, usize> = HashMap::new();
+        let mut next_run_lengths: HashMap<usize, usize> = HashMap::new();
 
         for i in a_low..a_high {
-            let mut next_run_lengths: HashMap<usize, usize> = HashMap::new();
+            next_run_lengths.clear();
             if let Some(positions) = self.b2j.get(&self.a[i]) {
                 for &j in positions {
                     if j < b_low {
@@ -105,7 +106,7 @@ impl<'a> SequenceMatcher<'a> {
                     }
                 }
             }
-            run_lengths = next_run_lengths;
+            std::mem::swap(&mut run_lengths, &mut next_run_lengths);
         }
 
         // Grow the block over elements that were dropped from the index above.

@@ -20,7 +20,6 @@ use crate::planning::{RenameOp, RenamePlan};
 /// A cheap fingerprint of a path, used to spot changes between two points in time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileState {
-    exists: bool,
     is_file: bool,
     identity: Option<(u64, u64)>,
     size: Option<u64>,
@@ -31,7 +30,6 @@ impl FileState {
     pub fn capture(path: &Path) -> Self {
         let Ok(metadata) = fs::metadata(path) else {
             return Self {
-                exists: false,
                 is_file: false,
                 identity: None,
                 size: None,
@@ -39,7 +37,6 @@ impl FileState {
             };
         };
         Self {
-            exists: true,
             is_file: metadata.is_file(),
             identity: file_identity(&metadata),
             size: Some(metadata.len()),

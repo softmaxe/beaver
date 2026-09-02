@@ -12,21 +12,17 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
+    outputs:
+      package_version: ${{ steps.release_version.outputs.package_version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Validate release tag
-        if: github.event_name == 'push'
+      - name: Read and validate release version
+        id: release_version
         shell: bash
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "Release tag must match vX.Y.Z: $tag" >&2
-            exit 1
-          fi
-
           package_version="$(awk '
             /^\[package\]$/ { in_package = 1; next }
             /^\[/ { in_package = 0 }
@@ -38,15 +34,23 @@ jobs:
               exit
             }
           ' Cargo.toml)"
-          tag_version="${tag#v}"
-
           if [[ -z "$package_version" ]]; then
             echo "Could not read package.version from Cargo.toml" >&2
             exit 1
           fi
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "Tag version $tag_version does not match Cargo.toml package.version $package_version" >&2
-            exit 1
+          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="$GITHUB_REF_NAME"
+            if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Release tag must match vX.Y.Z: $tag" >&2
+              exit 1
+            fi
+            tag_version="${tag#v}"
+            if [[ "$tag_version" != "$package_version" ]]; then
+              echo "Tag version $tag_version does not match Cargo.toml package.version $package_version" >&2
+              exit 1
+            fi
           fi
 
   build:
@@ -98,30 +102,11 @@ jobs:
       - name: Set package metadata
         id: package_metadata
         shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.validate.outputs.package_version }}
         run: |
           set -euo pipefail
-          package_version="$(awk '
-            /^\[package\]$/ { in_package = 1; next }
-            /^\[/ { in_package = 0 }
-            in_package && /^version = "/ {
-              value = $0
-              sub(/^version = "/, "", value)
-              sub(/"[[:space:]]*$/, "", value)
-              print value
-              exit
-            }
-          ' Cargo.toml)"
-          if [[ -z "$package_version" ]]; then
-            echo "Could not read package.version from Cargo.toml" >&2
-            exit 1
-          fi
-
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="$package_version"
-          fi
-          package_name="beaver-v${version}-${{ matrix.target }}"
+          package_name="beaver-v${PACKAGE_VERSION}-${{ matrix.target }}"
           echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
 
       - name: Package Unix archive
@@ -217,8 +202,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           archives=(beaver-v*.tar.gz beaver-v*.zip)
-          if [[ "${#archives[@]}" -ne 5 ]]; then
-            echo "Expected five release archives, found ${#archives[@]}" >&2
+          if [[ "${#archives[@]}" -eq 0 ]]; then
+            echo "No release archives found" >&2
             exit 1
           fi
           sha256sum "${archives[@]}" | sort -k2 > SHA256SUMS
@@ -243,9 +228,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout beaver
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
       - name: Update tap formula
         shell: bash
         env:

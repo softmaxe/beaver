@@ -178,13 +178,11 @@ impl Preview {
         self.ticked.iter().filter(|ticked| **ticked).count()
     }
 
-    fn chosen(&self) -> Vec<PreparedOperation> {
+    fn chosen(&self) -> impl Iterator<Item = &PreparedOperation> {
         self.prepared
             .iter()
             .zip(&self.ticked)
-            .filter(|(_, ticked)| **ticked)
-            .map(|(prepared, _)| prepared.clone())
-            .collect()
+            .filter_map(|(prepared, ticked)| ticked.then_some(prepared))
     }
 }
 
@@ -436,6 +434,11 @@ impl App {
         self.preview = None;
     }
 
+    fn edit_directory(&mut self, edit: impl FnOnce(&mut TextInput)) {
+        edit(&mut self.directory);
+        self.invalidate_preview();
+    }
+
     /// The button on the right of every card: move one step along.
     pub fn advance(&mut self) {
         match self.step {
@@ -451,11 +454,12 @@ impl App {
         match self.step {
             Step::Folder => {}
             Step::Rules => self.go_to(Step::Folder),
-            Step::Preview if self.scanning => {
-                self.invalidate_preview();
+            Step::Preview => {
+                if self.scanning {
+                    self.invalidate_preview();
+                }
                 self.go_to(Step::Rules);
             }
-            Step::Preview => self.go_to(Step::Rules),
             Step::Apply if self.applying => {}
             Step::Apply => self.start_over(),
         }
@@ -538,15 +542,15 @@ impl App {
             self.status = Status::new("Nothing to apply — preview first", StatusKind::Error);
             return;
         };
-        let chosen = preview.chosen();
-        if chosen.is_empty() {
+        let count = preview.ticked_count();
+        if count == 0 {
             self.status = Status::new("Tick at least one subtitle", StatusKind::Error);
             return;
         }
 
         let root = preview.plan.root.clone();
-        let examples = chosen
-            .iter()
+        let examples = preview
+            .chosen()
             .take(CONFIRM_EXAMPLE_LIMIT)
             .map(|prepared| {
                 format!(
@@ -556,17 +560,14 @@ impl App {
                 )
             })
             .collect();
-        self.modal = Some(Modal::Confirm {
-            count: chosen.len(),
-            examples,
-        });
+        self.modal = Some(Modal::Confirm { count, examples });
     }
 
     fn start_apply(&mut self) {
         let Some(preview) = self.preview.as_ref() else {
             return;
         };
-        let chosen = preview.chosen();
+        let chosen: Vec<_> = preview.chosen().cloned().collect();
         if chosen.is_empty() {
             return;
         }
@@ -578,27 +579,18 @@ impl App {
         self.status = Status::new("Renaming…", StatusKind::Working);
 
         let sender = self.sender.clone();
-        let progress = self.sender.clone();
         thread::spawn(move || {
             let result = apply_operations_reporting(&chosen, &root, false, true, |done| {
-                let _ = progress.send(Update::Progress(done));
+                let _ = sender.send(Update::Progress(done));
             });
             let _ = sender.send(Update::Applied(Box::new(result)));
         });
     }
 
     fn action_browse(&mut self) {
-        let typed = self.directory.value();
-        let start = if typed.trim().is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-        } else {
-            let resolved = crate::paths::resolve(Path::new(typed.trim()));
-            if resolved.is_dir() {
-                resolved
-            } else {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-            }
-        };
+        let start = self
+            .resolved_directory()
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
         self.modal = Some(Modal::Picker(Picker::new(&start)));
     }
 
@@ -684,37 +676,18 @@ impl App {
             KeyCode::Up => self.move_focus(-1),
             KeyCode::Char('a') if control => self.directory.move_home(),
             KeyCode::Char('e') if control => self.directory.move_end(),
-            KeyCode::Char('u') if control => {
-                self.directory.clear();
-                self.invalidate_preview();
-            }
-            KeyCode::Char('k') if control => {
-                self.directory.delete_to_end();
-                self.invalidate_preview();
-            }
-            KeyCode::Char('w') if control => {
-                self.directory.delete_previous_word();
-                self.invalidate_preview();
-            }
+            KeyCode::Char('u') if control => self.edit_directory(TextInput::clear),
+            KeyCode::Char('k') if control => self.edit_directory(TextInput::delete_to_end),
+            KeyCode::Char('w') if control => self.edit_directory(TextInput::delete_previous_word),
             // Anything else held with control is a command from elsewhere; it
             // must not end up in the path.
             KeyCode::Char(_) if control => {}
-            KeyCode::Char(character) => {
-                self.directory.insert(character);
-                self.invalidate_preview();
-            }
+            KeyCode::Char(character) => self.edit_directory(|input| input.insert(character)),
             KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.directory.delete_previous_word();
-                self.invalidate_preview();
+                self.edit_directory(TextInput::delete_previous_word)
             }
-            KeyCode::Backspace => {
-                self.directory.backspace();
-                self.invalidate_preview();
-            }
-            KeyCode::Delete => {
-                self.directory.delete();
-                self.invalidate_preview();
-            }
+            KeyCode::Backspace => self.edit_directory(TextInput::backspace),
+            KeyCode::Delete => self.edit_directory(TextInput::delete),
             KeyCode::Left => self.directory.move_left(),
             KeyCode::Right => self.directory.move_right(),
             KeyCode::Home => self.directory.move_home(),
@@ -762,20 +735,25 @@ impl App {
 
     /// Enter or space on whatever currently holds the keyboard.
     fn activate(&mut self) {
-        match self.control() {
-            Some(Control::Path) => self.advance(),
-            Some(Control::Browse) => self.action_browse(),
-            Some(Control::Level) => self.set_level(MatchLevel::from_index(
+        if let Some(control) = self.control() {
+            self.activate_control(control);
+        }
+    }
+
+    fn activate_control(&mut self, control: Control) {
+        match control {
+            Control::Path => self.advance(),
+            Control::Browse => self.action_browse(),
+            Control::Level => self.set_level(MatchLevel::from_index(
                 (self.level.index() + 1) % MatchLevel::ALL.len(),
             )),
-            Some(Control::Recursive) => {
+            Control::Recursive => {
                 self.recursive = !self.recursive;
                 self.invalidate_preview();
             }
-            Some(Control::List) => self.toggle_highlighted(),
-            Some(Control::Back) => self.back(),
-            Some(Control::Advance) | Some(Control::Again) => self.advance(),
-            None => {}
+            Control::List => self.toggle_highlighted(),
+            Control::Back => self.back(),
+            Control::Advance | Control::Again => self.advance(),
         }
     }
 
@@ -978,15 +956,8 @@ impl App {
         self.focus_on(control);
         match control {
             // The field only takes focus; clicking it must not submit it.
-            Control::Path => {}
-            Control::Browse => self.action_browse(),
-            Control::Recursive => {
-                self.recursive = !self.recursive;
-                self.invalidate_preview();
-            }
-            Control::Level | Control::List => {}
-            Control::Back => self.back(),
-            Control::Advance | Control::Again => self.advance(),
+            Control::Path | Control::Level | Control::List => {}
+            _ => self.activate_control(control),
         }
     }
 
