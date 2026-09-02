@@ -338,4 +338,16 @@ jobs:
             exit 0
           fi
           git -C "$tmp_tap" commit -m "chore: bump beaver to ${version}"
-          git -C "$tmp_tap" push origin main
+
+          for attempt in 1 2 3; do
+            if git -C "$tmp_tap" push origin main; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "Failed to push tap after 3 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 2))
+            git -C "$tmp_tap" fetch origin main
+            git -C "$tmp_tap" rebase origin/main
+          done
