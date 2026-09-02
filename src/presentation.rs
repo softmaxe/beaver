@@ -4,6 +4,8 @@
 //! the words a person reads, so the CLI and the TUI never disagree about what a
 //! result is called.
 
+use clap::ValueEnum;
+
 use crate::planning::{plan_virtual_files, MatchReason, PlanOptions, RenamePlan, SkipReason};
 
 /// Pick the singular or plural wording for `count`.
@@ -19,7 +21,7 @@ pub fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
 ///
 /// A named level rather than a raw threshold: `0.72` means nothing to a person,
 /// "balanced" does. Episode-id matches ignore the level entirely.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum MatchLevel {
     Relaxed,
     #[default]
@@ -32,9 +34,9 @@ impl MatchLevel {
 
     pub fn score(self) -> f64 {
         match self {
-            Self::Relaxed => 0.60,
-            Self::Balanced => 0.72,
-            Self::Cautious => 0.84,
+            Self::Relaxed => crate::planning::RELAXED_MIN_SCORE,
+            Self::Balanced => crate::planning::BALANCED_MIN_SCORE,
+            Self::Cautious => crate::planning::CAUTIOUS_MIN_SCORE,
         }
     }
 

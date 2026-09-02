@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::applying::PreparedOperation;
 use crate::paths::display_path;
@@ -952,6 +952,18 @@ fn draw_button(
     let x = if right { area.right() - width } else { area.x };
     let rect = Rect::new(x, area.y, width, 1);
     let under = hovered(app.hover, rect);
+    render_button(frame, rect, label, key, kind, under);
+    app.hits.push((rect, hit));
+}
+
+fn render_button(
+    frame: &mut Frame,
+    rect: Rect,
+    label: &str,
+    key: &str,
+    kind: ButtonKind,
+    under: bool,
+) {
     let fill = if under {
         theme::hovered_fill(kind.colours().0)
     } else {
@@ -962,7 +974,6 @@ fn draw_button(
     spans.extend(button_spans(label, key, kind, under));
     spans.push(pad);
     frame.render_widget(Paragraph::new(Line::from(spans)), rect);
-    app.hits.push((rect, hit));
 }
 
 /// A single line of text, centred in both directions.
@@ -1323,16 +1334,7 @@ fn draw_dialog_buttons(
     for ((hit, label, key, kind), width) in buttons.iter().zip(widths) {
         let rect = Rect::new(x, area.y, width, 1);
         let under = hovered(hover, rect);
-        let fill = if under {
-            theme::hovered_fill(kind.colours().0)
-        } else {
-            kind.colours().0
-        };
-        let pad = Span::styled(" ".repeat(BUTTON_PADDING), Style::default().bg(fill));
-        let mut spans = vec![pad.clone()];
-        spans.extend(button_spans(label, key, *kind, under));
-        spans.push(pad);
-        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        render_button(frame, rect, label, key, *kind, under);
         hits.push((rect, *hit));
         x += width + GAP;
     }
@@ -1363,7 +1365,7 @@ fn fit(text: &str, width: usize) -> String {
     let mut kept: Vec<char> = Vec::new();
     let mut used = 1; // the leading ellipsis
     for character in text.chars().rev() {
-        let character_width = UnicodeWidthStr::width(character.to_string().as_str());
+        let character_width = character.width().unwrap_or(0);
         if used + character_width > width {
             break;
         }

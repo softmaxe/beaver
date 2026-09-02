@@ -43,7 +43,7 @@ impl Picker {
                     }
                     self.entries.push(path);
                 }
-                self.entries.sort_by_key(|path| sort_key(path));
+                self.entries.sort_by_cached_key(|path| sort_key(path));
             }
             Err(error) => self.error = Some(error.to_string()),
         }

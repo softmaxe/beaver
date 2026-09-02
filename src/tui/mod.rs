@@ -44,7 +44,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, directory: Option<&Path>)
         app.poll_workers();
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
-        if !event::poll(TICK)? {
+        if app.busy() && !event::poll(TICK)? {
             app.ticks = app.ticks.wrapping_add(1);
             continue;
         }

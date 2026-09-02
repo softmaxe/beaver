@@ -9,12 +9,14 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
 use crate::applying::{apply_operations, prepare_operations};
 use crate::paths::{display_path, file_name};
 use crate::planning::{plan_directory, PlanOptions, RenameOp, RenamePlan};
-use crate::presentation::{match_badge, skip_label, MatchLevel};
+use crate::presentation::{match_badge, skip_label};
+
+pub use crate::presentation::MatchLevel as Level;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -73,23 +75,6 @@ pub struct Cli {
     pub force: bool,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Level {
-    Relaxed,
-    Balanced,
-    Cautious,
-}
-
-impl From<Level> for MatchLevel {
-    fn from(level: Level) -> Self {
-        match level {
-            Level::Relaxed => Self::Relaxed,
-            Level::Balanced => Self::Balanced,
-            Level::Cautious => Self::Cautious,
-        }
-    }
-}
-
 impl Cli {
     fn plan_options(&self) -> PlanOptions {
         let defaults = PlanOptions::default();
@@ -97,9 +82,7 @@ impl Cli {
             recursive: self.recursive,
             strict: self.strict,
             overwrite_existing: self.force,
-            min_score: self
-                .min_score
-                .unwrap_or_else(|| MatchLevel::from(self.level).score()),
+            min_score: self.min_score.unwrap_or_else(|| self.level.score()),
             video_exts: if self.video_ext.is_empty() {
                 defaults.video_exts
             } else {
@@ -250,7 +233,8 @@ fn confirm(count: usize) -> bool {
     if io::stdin().read_line(&mut answer).is_err() {
         return false;
     }
-    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+    let answer = answer.trim();
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
 #[cfg(test)]
@@ -276,7 +260,7 @@ mod tests {
     #[test]
     fn a_level_maps_onto_a_threshold() {
         let cli = Cli::parse_from(["beaver", "/tmp", "--level", "cautious"]);
-        assert_eq!(cli.plan_options().min_score, MatchLevel::Cautious.score());
+        assert_eq!(cli.plan_options().min_score, Level::Cautious.score());
 
         let cli = Cli::parse_from([
             "beaver",
