@@ -16,7 +16,8 @@ Rename subtitle files to match the videos beside them.
 </p>
 
 beaver scans a video library and proposes new names for subtitle files. Use the terminal interface
-to review and select each rename, or use the CLI for scripts and batch work.
+to review and select each rename, or use the CLI for scripts and batch work. Both front ends match
+files only within the same directory.
 
 - Matches episode IDs such as `S02E01` and `2x01`, then falls back to filename similarity.
 - Scans subfolders when requested, but never matches files from different folders.
@@ -25,7 +26,7 @@ to review and select each rename, or use the CLI for scripts and batch work.
 
 ## Install
 
-### Homebrew on macOS or Linux
+### Homebrew on Apple silicon macOS or Linux
 
 ```bash
 brew install softmaxe/tap/beaver
@@ -35,9 +36,10 @@ Upgrade later with `brew upgrade beaver`.
 
 ### Prebuilt binaries
 
-Download the archive for Windows, macOS, or Linux from
-[GitHub Releases](https://github.com/softmaxe/beaver/releases). Extract it and place `beaver` or
-`beaver.exe` on your `PATH`.
+Download an archive for Windows, macOS, or Linux from
+[GitHub Releases](https://github.com/softmaxe/beaver/releases). Releases currently provide
+`x86_64` and `aarch64` Linux binaries, an `aarch64` macOS binary, and `x86_64` and `aarch64`
+Windows binaries. Extract the archive and place `beaver` or `beaver.exe` on your `PATH`.
 
 Release binaries are unsigned, so macOS Gatekeeper or Windows SmartScreen may show a warning.
 
@@ -74,7 +76,8 @@ Apply the displayed plan after confirmation:
 beaver /path/to/library --apply
 ```
 
-Add `--recursive` to include subfolders. Matching still stays within each folder.
+Add `--recursive` to include subfolders. Matching still stays within each folder. The path form
+without `--tui` is the CLI; omitting the path opens the TUI.
 
 ## Terminal interface
 
@@ -89,13 +92,14 @@ Keyboard and mouse input are both supported. Press `?` or `F1` for the full shor
 keys are `Enter` to continue, arrow keys or `hjkl` to move, `Space` to toggle a proposal, `s` to
 view skipped subtitles, and `q` to quit.
 
-The TUI never invents a suffix for a taken target name and never overwrites an existing file. After
-an apply finishes, it discards the old preview and scans again for the next run.
+The TUI uses strict collision handling: it skips a rename when the plain target name is already
+taken. It never invents a suffix or overwrites an existing file. After an apply finishes, it
+discards the old preview and scans again for the next run.
 
 ## CLI
 
-Supplying a path runs the CLI. A plain path and `--dry-run` both print the plan without changing
-files.
+Supplying a path runs the CLI (unless `--tui` is present). A plain path and `--dry-run` both print
+the plan without changing files. `--apply` is required to rename anything.
 
 ```bash
 # Preview only
@@ -113,19 +117,19 @@ Common options:
 
 | Option | What it does |
 | --- | --- |
-| `--tui` | Open the TUI, with the supplied path filled in. |
+| `--tui` | Open the TUI, with the supplied path filled in; other CLI matching and apply options are not used by the TUI. |
 | `-r`, `--recursive` | Scan subfolders. Matching remains within each folder. |
 | `--level relaxed\|balanced\|cautious` | Set the fuzzy matching level. The default is `balanced`. |
 | `--min-score SCORE` | Set a fuzzy threshold from `0` to `1`, overriding `--level`. |
-| `--video-ext EXT` | Replace the default video extensions. Repeat for multiple values. |
-| `--sub-ext EXT` | Replace the default subtitle extensions. Repeat for multiple values. |
+| `--video-ext EXT` | Replace the default video extensions. A leading `.` is optional; repeat for multiple values. |
+| `--sub-ext EXT` | Replace the default subtitle extensions. A leading `.` is optional; repeat for multiple values. |
 | `--strict` | Skip a rename if its plain target name already exists. |
 | `--apply` | Apply the plan after confirmation. |
 | `-y`, `--yes` | Skip the CLI confirmation prompt. |
 | `--force` | Allow the CLI to overwrite an existing target. Conflicts with `--strict`. |
 
 Without `--strict`, a target-name collision gets a detected language tag when possible, then a
-numeric suffix. `--force` is the only mode that overwrites a file.
+numeric suffix. `--force` is the only mode that overwrites a file, and it applies only to the CLI.
 
 ## Matching rules
 

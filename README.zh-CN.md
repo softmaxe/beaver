@@ -16,7 +16,7 @@
 </p>
 
 beaver 扫描视频库并生成字幕重命名方案。你可以在终端界面中逐项检查，也可以通过 CLI 批量处理或
-编写脚本。
+编写脚本。两种界面都只会匹配同一目录中的文件。
 
 - 优先匹配 `S02E01`、`2x01` 等剧集编号，再按文件名相似度匹配。
 - 可扫描子目录，但不会匹配不同目录中的文件。
@@ -25,7 +25,7 @@ beaver 扫描视频库并生成字幕重命名方案。你可以在终端界面�
 
 ## 安装
 
-### macOS 或 Linux 使用 Homebrew
+### Apple silicon macOS 或 Linux 使用 Homebrew
 
 ```bash
 brew install softmaxe/tap/beaver
@@ -36,7 +36,8 @@ brew install softmaxe/tap/beaver
 ### 下载预编译版本
 
 从 [GitHub Releases](https://github.com/softmaxe/beaver/releases) 下载 Windows、macOS 或 Linux
-版本，解压后把 `beaver` 或 `beaver.exe` 放入 `PATH`。
+版本。目前发布包包括 Linux `x86_64` 和 `aarch64`、macOS `aarch64`，以及 Windows `x86_64` 和
+`aarch64` 版本。解压后把 `beaver` 或 `beaver.exe` 放入 `PATH`。
 
 Release binary 尚未签名，macOS Gatekeeper 或 Windows SmartScreen 可能会显示警告。
 
@@ -73,7 +74,8 @@ beaver /path/to/library
 beaver /path/to/library --apply
 ```
 
-添加 `--recursive` 可扫描子目录，匹配仍限制在各自目录内。
+添加 `--recursive` 可扫描子目录，匹配仍限制在各自目录内。不带 `--tui` 时，传入路径使用 CLI；
+省略路径则打开 TUI。
 
 ## 终端界面
 
@@ -87,12 +89,13 @@ TUI 分为四步：
 界面同时支持键盘和鼠标。按 `?` 或 `F1` 查看完整快捷键。常用按键包括：`Enter` 继续，方向键或
 `hjkl` 移动，`Space` 切换勾选，`s` 查看跳过的字幕，`q` 退出。
 
-目标文件名被占用时，TUI 不会添加后缀，也不会覆盖已有文件。应用完成后，beaver 会丢弃旧预览，
-下次操作将重新扫描目录。
+TUI 使用严格的冲突处理：目标文件名已被占用时跳过该重命名，不添加后缀，也不覆盖已有文件。应用
+完成后，beaver 会丢弃旧预览，下次操作将重新扫描目录。
 
 ## CLI
 
-传入路径后会使用 CLI。直接传入路径或添加 `--dry-run` 都只打印方案，不修改文件。
+传入路径后会使用 CLI（除非同时指定 `--tui`）。直接传入路径或添加 `--dry-run` 都只打印方案，不
+修改文件；必须指定 `--apply` 才会重命名。
 
 ```bash
 # 仅预览
@@ -110,19 +113,19 @@ beaver /path/to/library --apply --yes
 
 | 选项 | 作用 |
 | --- | --- |
-| `--tui` | 打开 TUI，并自动填入传入的路径。 |
+| `--tui` | 打开 TUI，并自动填入传入的路径；TUI 不使用其他 CLI 匹配或应用选项。 |
 | `-r`、`--recursive` | 扫描子目录，匹配仍限制在各自目录内。 |
 | `--level relaxed\|balanced\|cautious` | 设置模糊匹配等级，默认是 `balanced`。 |
 | `--min-score SCORE` | 设置 `0` 到 `1` 的模糊匹配阈值，覆盖 `--level`。 |
-| `--video-ext EXT` | 替换默认视频扩展名，可重复传入多个值。 |
-| `--sub-ext EXT` | 替换默认字幕扩展名，可重复传入多个值。 |
+| `--video-ext EXT` | 替换默认视频扩展名，可带或不带开头的 `.`，可重复传入多个值。 |
+| `--sub-ext EXT` | 替换默认字幕扩展名，可带或不带开头的 `.`，可重复传入多个值。 |
 | `--strict` | 普通目标文件名已存在时跳过该方案。 |
 | `--apply` | 确认后应用方案。 |
 | `-y`、`--yes` | 跳过 CLI 确认。 |
 | `--force` | 允许 CLI 覆盖已有目标文件，与 `--strict` 互斥。 |
 
 未使用 `--strict` 时，如果目标文件名被占用，beaver 会优先添加识别出的语言标签，否则添加数字
-后缀。只有 `--force` 会覆盖文件。
+后缀。只有 CLI 的 `--force` 会覆盖文件。
 
 ## 匹配规则
 
