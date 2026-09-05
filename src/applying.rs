@@ -60,7 +60,6 @@ fn file_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
 /// A planned rename, plus the filesystem state observed when the plan was made.
 #[derive(Clone, Debug)]
 pub struct PreparedOperation {
-    pub id: usize,
     pub operation: RenameOp,
     source_state: FileState,
     destination_state: FileState,
@@ -79,7 +78,6 @@ impl PreparedOperation {
 /// The result of a single rename, with paths already formatted for display.
 #[derive(Clone, Debug)]
 pub struct ApplyOutcome {
-    pub id: usize,
     pub source: String,
     pub target: String,
     pub error: Option<String>,
@@ -124,13 +122,11 @@ impl fmt::Display for PlanChanged {
 
 impl std::error::Error for PlanChanged {}
 
-/// Pair every operation in `plan` with a stable id and a snapshot of its paths.
+/// Pair every operation in `plan` with a snapshot of its paths.
 pub fn prepare_operations(plan: &RenamePlan) -> Vec<PreparedOperation> {
     plan.operations
         .iter()
-        .enumerate()
-        .map(|(index, operation)| PreparedOperation {
-            id: index + 1,
+        .map(|operation| PreparedOperation {
             source_state: FileState::capture(&operation.source),
             destination_state: FileState::capture(&operation.destination),
             operation: operation.clone(),
@@ -194,7 +190,6 @@ pub fn apply_operations_reporting(
         let source = prepared.source();
         let destination = prepared.destination();
         let outcome = ApplyOutcome {
-            id: prepared.id,
             source: display_path(source, root),
             target: display_path(destination, root),
             error: None,

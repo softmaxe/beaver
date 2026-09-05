@@ -75,7 +75,6 @@ pub struct RenamePlan {
     pub skipped: Vec<SkippedRename>,
     pub video_count: usize,
     pub subtitle_count: usize,
-    pub directory_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -222,11 +221,12 @@ pub fn plan_directory(root: &Path, options: &PlanOptions) -> Result<RenamePlan, 
     ))
 }
 
-/// Plan renames for a made-up file listing, used by the demo mode.
+/// Plan renames for a made-up file listing used by tests.
 ///
 /// Nothing here touches the filesystem: "does this target already exist" is
 /// answered from the listing itself.
-pub fn plan_virtual_files(file_names: &[&str], options: &PlanOptions) -> RenamePlan {
+#[cfg(test)]
+pub(crate) fn plan_virtual_files(file_names: &[&str], options: &PlanOptions) -> RenamePlan {
     let root = PathBuf::from("/virtual-subtitle-library");
     let paths: Vec<PathBuf> = file_names.iter().map(|name| root.join(name)).collect();
     let existing: HashSet<PathBuf> = paths.iter().cloned().collect();
@@ -298,7 +298,6 @@ fn create_plan(
 
     let video_count = videos_by_directory.values().map(Vec::len).sum();
     let subtitle_count = subtitles_by_directory.values().map(Vec::len).sum();
-    let directory_count = directories.len();
 
     let mut operations = Vec::new();
     let mut skipped = Vec::new();
@@ -335,7 +334,6 @@ fn create_plan(
         skipped,
         video_count,
         subtitle_count,
-        directory_count,
     }
 }
 
@@ -570,7 +568,6 @@ mod tests {
         );
         assert_eq!(plan.video_count, 2);
         assert_eq!(plan.subtitle_count, 1);
-        assert_eq!(plan.directory_count, 1);
     }
 
     #[test]
@@ -738,7 +735,6 @@ mod tests {
         let plan = plan(&["a/Nebula.S01E01.mkv", "b/Nebula.S01E01.srt"]);
         assert!(plan.operations.is_empty());
         assert_eq!(plan.skipped[0].reason, SkipReason::NoVideo);
-        assert_eq!(plan.directory_count, 2);
     }
 
     #[test]
@@ -791,7 +787,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deep.video_count, 2);
-        assert_eq!(deep.directory_count, 2);
         // The nested subtitle already matches, so only the top-level one moves.
         assert_eq!(deep.operations.len(), 1);
     }

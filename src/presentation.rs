@@ -1,4 +1,4 @@
-//! The vocabulary the interfaces speak: match levels, human wording, demo data.
+//! The vocabulary the interfaces speak: match levels and human wording.
 //!
 //! [`crate::planning`] deals in scores and enums. Everything here turns those into
 //! the words a person reads, so the CLI and the TUI never disagree about what a
@@ -6,7 +6,9 @@
 
 use clap::ValueEnum;
 
-use crate::planning::{plan_virtual_files, MatchReason, PlanOptions, RenamePlan, SkipReason};
+#[cfg(test)]
+use crate::planning::{plan_virtual_files, PlanOptions, RenamePlan};
+use crate::planning::{MatchReason, SkipReason};
 
 /// Pick the singular or plural wording for `count`.
 pub fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
@@ -73,7 +75,8 @@ impl MatchLevel {
 /// These names cover what the interface has to report: episode matches, language
 /// tags that get dropped on the way to the target name, and one subtitle that
 /// matches nothing at all.
-pub const DEMO_FILES: &[&str] = &[
+#[cfg(test)]
+pub(crate) const DEMO_FILES: &[&str] = &[
     "Nebula.Archive.S01E01.2160p.WEB-DL.mkv",
     "Nebula.Archive.S01E02.2160p.WEB-DL.mkv",
     "Nebula.Archive.S01E03.2160p.WEB-DL.mkv",
@@ -84,7 +87,8 @@ pub const DEMO_FILES: &[&str] = &[
 ];
 
 /// Build the demo plan without touching the filesystem.
-pub fn demo_plan() -> RenamePlan {
+#[cfg(test)]
+pub(crate) fn demo_plan() -> RenamePlan {
     plan_virtual_files(DEMO_FILES, &PlanOptions::default())
 }
 
