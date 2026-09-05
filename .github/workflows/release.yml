@@ -18,6 +18,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Validate tap publishing credentials
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "${TAP_GITHUB_TOKEN:-}" ]]; then
+            echo "::error::TAP_GITHUB_TOKEN is required to publish the Homebrew formula."
+            exit 1
+          fi
+
       - name: Read and validate release version
         id: release_version
         shell: bash
@@ -237,9 +248,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${TAP_GITHUB_TOKEN:-}" ]]; then
-            echo "TAP_GITHUB_TOKEN is not set, skip tap update." >&2
+            echo "::error::TAP_GITHUB_TOKEN is required to publish the Homebrew formula." >&2
             echo "Create a PAT with repo scope and add it as TAP_GITHUB_TOKEN in softmaxe/beaver settings." >&2
-            exit 0
+            exit 1
           fi
 
           version="${TAG#v}"
