@@ -60,41 +60,74 @@ pub fn split_tokens(text: &str) -> Vec<String> {
 ///
 /// Bracketed groups go first, then junk tokens, then any trailing language tags;
 /// what is left is joined without separators, so `.` `_` and ` ` stop mattering.
+///
+/// Tokens are appended straight to the result rather than collected first, so a
+/// scan of a large library allocates a couple of strings per file, not one per
+/// token.
 pub fn normalize_stem(stem: &str) -> String {
     let without_brackets = strip_bracketed_groups(stem);
-    let mut tokens: Vec<String> = split_tokens(&without_brackets)
-        .iter()
-        .map(|token| token.to_lowercase())
-        .filter(|token| !is_junk_token(token))
-        .collect();
-    while tokens.last().is_some_and(|token| is_language_tag(token)) {
-        tokens.pop();
+    let mut kept = String::with_capacity(without_brackets.len());
+    // Where in `kept` each surviving token begins, so trailing language tags can
+    // be cut back off without re-splitting.
+    let mut starts: Vec<usize> = Vec::new();
+    let mut token = String::new();
+
+    for character in without_brackets.nfc() {
+        if character.is_alphanumeric() {
+            token.push(character);
+            continue;
+        }
+        push_token(&mut token, &mut kept, &mut starts);
     }
-    tokens.concat()
+    push_token(&mut token, &mut kept, &mut starts);
+
+    while let Some(start) = starts.last().copied() {
+        if !is_language_tag(&kept[start..]) {
+            break;
+        }
+        kept.truncate(start);
+        starts.pop();
+    }
+    kept
+}
+
+/// Lowercase `token`, drop it if it is junk, and append what is left to `kept`.
+fn push_token(token: &mut String, kept: &mut String, starts: &mut Vec<usize>) {
+    if token.is_empty() {
+        return;
+    }
+    if token.is_ascii() {
+        token.make_ascii_lowercase();
+    } else {
+        *token = token.to_lowercase();
+    }
+    if !is_junk_token(token) {
+        starts.push(kept.len());
+        kept.push_str(token);
+    }
+    token.clear();
 }
 
 /// Replace every `[...]`, `(...)` or `{...}` group with a space.
 ///
 /// An unclosed opener is left alone rather than swallowing the rest of the name.
 fn strip_bracketed_groups(stem: &str) -> String {
-    let characters: Vec<char> = stem.chars().collect();
-    let mut result = String::new();
-    let mut index = 0;
-    while index < characters.len() {
-        let character = characters[index];
-        if matches!(character, '[' | '(' | '{') {
-            if let Some(offset) = characters[index + 1..]
-                .iter()
-                .position(|candidate| matches!(candidate, ']' | ')' | '}'))
-            {
-                result.push(' ');
-                index += offset + 2;
-                continue;
-            }
-        }
-        result.push(character);
-        index += 1;
+    let mut result = String::with_capacity(stem.len());
+    let mut rest = stem;
+    while let Some(opener) = rest.find(['[', '(', '{']) {
+        result.push_str(&rest[..opener]);
+        // Every bracket here is one byte, so slicing past it stays on a boundary.
+        let after_opener = &rest[opener + 1..];
+        let Some(closer) = after_opener.find([']', ')', '}']) else {
+            // Nothing closes it, and nothing further along can be a group
+            // either, so the rest of the stem is kept as it stands.
+            result.push_str(&rest[opener..]);
+            return result;
+        };
+        result.push(' ');
+        rest = &after_opener[closer + 1..];
     }
+    result.push_str(rest);
     result
 }
 
