@@ -6,10 +6,14 @@
 //! - [`applying`] carries a plan out, and owns every safety rule;
 //! - [`presentation`] holds the words and the match levels both front-ends use;
 //! - [`cli`] and [`tui`] are just two ways of driving the three above.
+//!
+//! [`parallel`] sits underneath them: folders are independent of each other, so
+//! reading and planning them runs on as many cores as the machine has.
 
 pub mod applying;
 pub mod cli;
 pub mod names;
+pub mod parallel;
 pub mod paths;
 pub mod planning;
 pub mod presentation;

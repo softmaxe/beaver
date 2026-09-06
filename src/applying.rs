@@ -123,21 +123,21 @@ impl fmt::Display for PlanChanged {
 impl std::error::Error for PlanChanged {}
 
 /// Pair every operation in `plan` with a snapshot of its paths.
+///
+/// Two metadata reads per rename adds up over a large plan, and none of them
+/// depend on each other, so they are spread over the machine.
 pub fn prepare_operations(plan: &RenamePlan) -> Vec<PreparedOperation> {
-    plan.operations
-        .iter()
-        .map(|operation| PreparedOperation {
-            source_state: FileState::capture(&operation.source),
-            destination_state: FileState::capture(&operation.destination),
-            operation: operation.clone(),
-        })
-        .collect()
+    crate::parallel::map(&plan.operations, |operation| PreparedOperation {
+        source_state: FileState::capture(&operation.source),
+        destination_state: FileState::capture(&operation.destination),
+        operation: operation.clone(),
+    })
 }
 
 /// Report which prepared operations no longer match what is on disk.
 pub fn detect_state_changes(operations: &[PreparedOperation]) -> Vec<String> {
-    let mut changes = Vec::new();
-    for prepared in operations {
+    crate::parallel::map(operations, |prepared| {
+        let mut changes = Vec::new();
         if FileState::capture(prepared.source()) != prepared.source_state {
             changes.push(format!("source changed: {}", file_name(prepared.source())));
         }
@@ -147,8 +147,9 @@ pub fn detect_state_changes(operations: &[PreparedOperation]) -> Vec<String> {
                 file_name(prepared.destination())
             ));
         }
-    }
-    changes
+        changes
+    })
+    .concat()
 }
 
 /// Execute `operations`, reporting each rename as an [`ApplyOutcome`].

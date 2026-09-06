@@ -9,10 +9,14 @@
 //! Layout is measured in character cells, not pixels. The smallest supported
 //! terminal is 80 × 24.
 
+use std::ops::Range;
+
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -648,28 +652,28 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     } else {
         let width = list_area.width as usize;
-        let items: Vec<ListItem> = preview
-            .prepared
+        let mut state = preview.state;
+        let window = visible_window(&mut state, matched, list_area.height as usize);
+        let offset = window.start;
+        let selected = state.selected();
+        let items: Vec<ListItem> = preview.prepared[window]
             .iter()
             .enumerate()
-            .map(|(index, prepared)| {
+            .map(|(row, prepared)| {
                 ListItem::new(operation_line(
                     prepared,
-                    preview.ticked[index],
+                    preview.ticked[offset + row],
                     &preview.plan,
                     width,
                 ))
             })
             .collect();
-        let selected = preview.state.selected();
         let list = List::new(items).highlight_style(
             Style::default()
                 .bg(theme::SELECTION_BACKGROUND)
                 .add_modifier(Modifier::BOLD),
         );
-        let mut state = preview.state;
-        frame.render_stateful_widget(list, list_area, &mut state);
-        let offset = state.offset();
+        frame.render_stateful_widget(list, list_area, &mut windowed(&state, offset));
         app.preview.as_mut().unwrap().state = state;
 
         for visible in 0..list_area.height as usize {
@@ -710,6 +714,41 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     draw_card_buttons(frame, app, buttons_area);
+}
+
+/// The slice of a list that is actually on screen, with `state` scrolled to it.
+///
+/// A preview can hold thousands of renames, and building a row for every one of
+/// them on every frame is work nobody ever sees. Every row here is one line
+/// tall, so where the viewport starts follows from the selection alone: keep it
+/// where it was unless the highlight has moved out of view.
+fn visible_window(state: &mut ListState, count: usize, height: usize) -> Range<usize> {
+    if count == 0 || height == 0 {
+        *state.offset_mut() = 0;
+        return 0..0;
+    }
+    let mut offset = state.offset().min(count - 1);
+    if let Some(selected) = state.selected() {
+        let selected = selected.min(count - 1);
+        offset = offset
+            .min(selected)
+            .max(selected + 1 - height.min(selected + 1));
+    }
+    offset = offset.min(count.saturating_sub(height));
+    *state.offset_mut() = offset;
+    offset..(offset + height).min(count)
+}
+
+/// A state that addresses the window rather than the whole list, so the rows
+/// handed to the widget are the only ones it has to know about.
+fn windowed(state: &ListState, offset: usize) -> ListState {
+    let mut windowed = ListState::default();
+    if let Some(selected) = state.selected() {
+        if selected >= offset {
+            windowed.select(Some(selected - offset));
+        }
+    }
+    windowed
 }
 
 fn operation_line(
@@ -1109,9 +1148,13 @@ fn draw_skipped(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let reason_width = 32.min(list_area.width as usize / 2);
     let path_width = (list_area.width as usize).saturating_sub(reason_width + 2);
-    let items: Vec<ListItem> = preview
-        .plan
-        .skipped
+    let hover = app.hover;
+    let Some(Modal::Skipped(state)) = app.modal.as_mut() else {
+        return;
+    };
+    let window = visible_window(state, count, list_area.height as usize);
+    let offset = window.start;
+    let items: Vec<ListItem> = preview.plan.skipped[window]
         .iter()
         .map(|skipped| {
             ListItem::new(Line::from(vec![
@@ -1134,12 +1177,7 @@ fn draw_skipped(frame: &mut Frame, area: Rect, app: &mut App) {
             .bg(theme::SELECTION_BACKGROUND)
             .add_modifier(Modifier::BOLD),
     );
-    let hover = app.hover;
-    let Some(Modal::Skipped(state)) = app.modal.as_mut() else {
-        return;
-    };
-    frame.render_stateful_widget(list, list_area, state);
-    let offset = state.offset();
+    frame.render_stateful_widget(list, list_area, &mut windowed(state, offset));
     for visible in 0..list_area.height as usize {
         if offset + visible >= count {
             break;
@@ -1424,5 +1462,41 @@ mod tests {
     #[test]
     fn wrap_breaks_on_words() {
         assert_eq!(wrap("one two three", 12), vec!["one two", "three"]);
+    }
+
+    /// The window has to track the highlight, or a row would be drawn that the
+    /// selection is not on.
+    #[test]
+    fn the_visible_window_follows_the_highlight() {
+        let mut state = ListState::default();
+        state.select(Some(0));
+        assert_eq!(visible_window(&mut state, 100, 10), 0..10);
+
+        // Moving past the bottom edge scrolls by exactly what is needed.
+        state.select(Some(10));
+        assert_eq!(visible_window(&mut state, 100, 10), 1..11);
+        state.select(Some(99));
+        assert_eq!(visible_window(&mut state, 100, 10), 90..100);
+        // And back up the same way.
+        state.select(Some(4));
+        assert_eq!(visible_window(&mut state, 100, 10), 4..14);
+    }
+
+    #[test]
+    fn the_visible_window_copes_with_lists_that_do_not_fill_it() {
+        let mut state = ListState::default();
+        state.select(Some(2));
+        assert_eq!(visible_window(&mut state, 3, 10), 0..3);
+        assert_eq!(state.offset(), 0);
+        assert_eq!(visible_window(&mut state, 0, 10), 0..0);
+        assert_eq!(visible_window(&mut state, 100, 0), 0..0);
+    }
+
+    #[test]
+    fn the_windowed_state_addresses_the_rows_that_were_built() {
+        let mut state = ListState::default();
+        state.select(Some(42));
+        assert_eq!(windowed(&state, 40).selected(), Some(2));
+        assert_eq!(windowed(&state, 0).offset(), 0);
     }
 }

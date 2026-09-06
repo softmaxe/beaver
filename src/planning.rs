@@ -9,10 +9,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
 use crate::names::{episode_key, language_tag, normalize_stem};
 use crate::paths::sort_key;
-use crate::similarity::ratio;
+use crate::similarity::{CharCounts, Scratch, Target};
 
 pub const VIDEO_EXTS_DEFAULT: &[&str] = &["mkv", "mp4", "avi", "mov", "wmv", "m4v", "webm"];
 pub const SUB_EXTS_DEFAULT: &[&str] = &["ass", "srt", "ssa", "vtt", "sub"];
@@ -138,68 +139,137 @@ pub fn normalize_extension(raw: &str) -> String {
 #[derive(Clone, Debug)]
 struct Candidate {
     path: PathBuf,
-    stem_norm: String,
+    /// The comparable form of the stem, as characters: fuzzy matching walks it
+    /// element by element, and every folder walks it once per video.
+    stem_norm: Vec<char>,
     episode_key: Option<String>,
 }
 
 impl Candidate {
     fn new(path: PathBuf) -> Self {
-        let stem = path
+        // `to_string_lossy` borrows for the usual case of a valid UTF-8 name, so
+        // scanning a large library does not allocate a string per file here.
+        let stem_norm = path
             .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
+            .map(|stem| normalize_stem(&stem.to_string_lossy()))
             .unwrap_or_default();
-        let name = path
+        let episode_key = path
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .and_then(|name| episode_key(&name.to_string_lossy()));
         Self {
-            stem_norm: normalize_stem(&stem),
-            episode_key: episode_key(&name),
+            stem_norm: stem_norm.chars().collect(),
+            episode_key,
             path,
         }
     }
 }
 
-/// Split `paths` into the video and subtitle candidates of each directory,
-/// keyed by the directory they live in. Anything with an unrecognised extension
-/// is dropped.
-fn classify(
-    paths: Vec<PathBuf>,
-    root: &Path,
-    options: &PlanOptions,
-) -> (
-    HashMap<PathBuf, Vec<Candidate>>,
-    HashMap<PathBuf, Vec<Candidate>>,
-) {
-    let video_exts: HashSet<String> = options
-        .video_exts
-        .iter()
-        .map(|e| normalize_extension(e))
-        .collect();
-    let sub_exts: HashSet<String> = options
-        .sub_exts
-        .iter()
-        .map(|e| normalize_extension(e))
-        .collect();
+/// One folder's worth of candidates.
+///
+/// Matching never crosses a folder boundary, so a group is a self-contained unit
+/// of work: it can be read, sorted and planned without looking at any other.
+#[derive(Debug, Default)]
+struct Group {
+    directory: PathBuf,
+    videos: Vec<Candidate>,
+    subtitles: Vec<Candidate>,
+}
 
-    let mut videos: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-    let mut subtitles: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-    for path in paths {
-        let Some(extension) = path.extension() else {
-            continue;
-        };
-        let extension = extension.to_string_lossy().to_lowercase();
-        let parent = path.parent().unwrap_or(root).to_path_buf();
-        let bucket = if video_exts.contains(&extension) {
-            &mut videos
-        } else if sub_exts.contains(&extension) {
-            &mut subtitles
-        } else {
-            continue;
-        };
-        bucket.entry(parent).or_default().push(Candidate::new(path));
+impl Group {
+    fn is_empty(&self) -> bool {
+        self.videos.is_empty() && self.subtitles.is_empty()
     }
-    (videos, subtitles)
+}
+
+/// The candidates of one folder in a stable order, without moving them.
+fn ordered(candidates: &[Candidate]) -> Vec<&Candidate> {
+    let mut ordered: Vec<&Candidate> = candidates.iter().collect();
+    ordered.sort_by_cached_key(|candidate| sort_key(&candidate.path));
+    ordered
+}
+
+/// The extension rules, normalised once instead of per file.
+struct Scan {
+    video_exts: Vec<String>,
+    sub_exts: Vec<String>,
+    recursive: bool,
+}
+
+impl Scan {
+    fn new(options: &PlanOptions) -> Self {
+        Self {
+            video_exts: options
+                .video_exts
+                .iter()
+                .map(|e| normalize_extension(e))
+                .collect(),
+            sub_exts: options
+                .sub_exts
+                .iter()
+                .map(|e| normalize_extension(e))
+                .collect(),
+            recursive: options.recursive,
+        }
+    }
+
+    /// Put `path` in the bucket its extension calls for, or drop it.
+    fn classify_into(&self, path: PathBuf, group: &mut Group) {
+        let Some(extension) = path.extension() else {
+            return;
+        };
+        if extension_matches(&self.video_exts, extension) {
+            group.videos.push(Candidate::new(path));
+        } else if extension_matches(&self.sub_exts, extension) {
+            group.subtitles.push(Candidate::new(path));
+        }
+    }
+
+    /// Read one directory into a group, returning the subdirectories to descend
+    /// into (empty unless the scan is recursive).
+    ///
+    /// Symlinked directories are not followed, so a loop cannot hang a scan.
+    fn read(&self, directory: &Path) -> std::io::Result<(Group, Vec<PathBuf>)> {
+        let mut group = Group {
+            directory: directory.to_path_buf(),
+            ..Group::default()
+        };
+        let mut subdirectories = Vec::new();
+        for entry in fs::read_dir(directory)?.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => {
+                    if self.recursive {
+                        subdirectories.push(path);
+                    }
+                }
+                Ok(file_type) if file_type.is_file() => self.classify_into(path, &mut group),
+                // Follows symlinks, so a link to a video counts as one.
+                _ if path.is_file() => self.classify_into(path, &mut group),
+                _ => {}
+            }
+        }
+        Ok((group, subdirectories))
+    }
+}
+
+/// Whether `extension` is in `list`, which holds normalised lowercase forms.
+///
+/// The lists are a handful of entries, so a scan beats hashing — and the ASCII
+/// path avoids lowercasing every filename's extension into a fresh string.
+fn extension_matches(list: &[String], extension: &std::ffi::OsStr) -> bool {
+    match extension.to_str() {
+        Some(extension) if extension.is_ascii() => list
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(extension)),
+        Some(extension) => {
+            let lowered = extension.to_lowercase();
+            list.contains(&lowered)
+        }
+        None => {
+            let lowered = extension.to_string_lossy().to_lowercase();
+            list.contains(&lowered)
+        }
+    }
 }
 
 /// Plan the renames for a real directory on disk. Reads, never writes.
@@ -209,16 +279,120 @@ pub fn plan_directory(root: &Path, options: &PlanOptions) -> Result<RenamePlan, 
         return Err(PlanError::NotADirectory(root));
     }
 
-    let (videos_by_directory, subtitles_by_directory) =
-        classify(collect_files(&root, options.recursive)?, &root, options);
+    let groups = scan_directory(&root, options)?;
+    Ok(create_plan(root, groups, options, &|path: &Path| {
+        path.exists()
+    }))
+}
 
-    Ok(create_plan(
-        root,
-        videos_by_directory,
-        subtitles_by_directory,
-        options,
-        &|path: &Path| path.exists(),
-    ))
+/// Read `root`, and everything below it when asked, into one group per folder.
+///
+/// The root itself must be readable; anything below it may not be, and an
+/// unreadable subdirectory is skipped rather than failing the whole run.
+fn scan_directory(root: &Path, options: &PlanOptions) -> std::io::Result<Vec<Group>> {
+    let scan = Scan::new(options);
+    let (root_group, subdirectories) = scan.read(root)?;
+
+    let mut groups = Vec::new();
+    if !root_group.is_empty() {
+        groups.push(root_group);
+    }
+    if !subdirectories.is_empty() {
+        groups.extend(walk(subdirectories, &scan));
+    }
+    Ok(groups)
+}
+
+/// Directories still to be read, and how many workers are reading right now.
+///
+/// The count is what tells a worker the difference between "nothing to do yet"
+/// and "nothing left to do at all".
+struct Pending {
+    stack: Vec<PathBuf>,
+    busy: usize,
+}
+
+struct Queue {
+    pending: Mutex<Pending>,
+    ready: Condvar,
+}
+
+impl Queue {
+    fn new(stack: Vec<PathBuf>) -> Self {
+        Self {
+            pending: Mutex::new(Pending { stack, busy: 0 }),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Claim the next directory, or `None` once the whole tree is read.
+    fn take(&self) -> Option<PathBuf> {
+        let mut pending = self.lock();
+        loop {
+            if let Some(directory) = pending.stack.pop() {
+                pending.busy += 1;
+                return Some(directory);
+            }
+            if pending.busy == 0 {
+                // Nothing queued and nobody still reading: everyone can stop.
+                self.ready.notify_all();
+                return None;
+            }
+            pending = self
+                .ready
+                .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Hand back whatever the claimed directory contained.
+    fn finish(&self, subdirectories: Vec<PathBuf>) {
+        let mut pending = self.lock();
+        pending.stack.extend(subdirectories);
+        pending.busy -= 1;
+        drop(pending);
+        self.ready.notify_all();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Walk the tree below the root, reading folders on several threads at once.
+fn walk(seed: Vec<PathBuf>, scan: &Scan) -> Vec<Group> {
+    let queue = Queue::new(seed);
+    let drain = || {
+        let mut groups = Vec::new();
+        while let Some(directory) = queue.take() {
+            let (group, subdirectories) = scan.read(&directory).unwrap_or_default();
+            queue.finish(subdirectories);
+            if !group.is_empty() {
+                groups.push(group);
+            }
+        }
+        groups
+    };
+
+    // How wide the tree turns out to be is not known until it has been walked,
+    // so the worker count comes from the machine rather than from the seed.
+    let workers = crate::parallel::worker_count(usize::MAX);
+    if workers <= 1 {
+        return drain();
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers).map(|_| scope.spawn(drain)).collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            })
+            .collect()
+    })
 }
 
 /// Plan renames for a made-up file listing used by tests.
@@ -230,102 +404,61 @@ pub(crate) fn plan_virtual_files(file_names: &[&str], options: &PlanOptions) -> 
     let root = PathBuf::from("/virtual-subtitle-library");
     let paths: Vec<PathBuf> = file_names.iter().map(|name| root.join(name)).collect();
     let existing: HashSet<PathBuf> = paths.iter().cloned().collect();
-    let (videos_by_directory, subtitles_by_directory) = classify(paths, &root, options);
+
+    let scan = Scan::new(options);
+    let mut groups: HashMap<PathBuf, Group> = HashMap::new();
+    for path in paths {
+        let directory = path.parent().unwrap_or(&root).to_path_buf();
+        let group = groups.entry(directory.clone()).or_insert_with(|| Group {
+            directory,
+            ..Group::default()
+        });
+        scan.classify_into(path, group);
+    }
 
     create_plan(
         root,
-        videos_by_directory,
-        subtitles_by_directory,
+        groups
+            .into_values()
+            .filter(|group| !group.is_empty())
+            .collect(),
         options,
         &move |path: &Path| existing.contains(path),
     )
 }
 
-/// List the files under `root`, optionally descending into subdirectories.
-///
-/// Symlinked directories are not followed, so a loop cannot hang a scan.
-/// Unreadable subdirectories are skipped rather than failing the whole run.
-fn collect_files(root: &Path, recursive: bool) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let mut directories = vec![root.to_path_buf()];
-    while let Some(directory) = directories.pop() {
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            // The root itself must be readable; anything below it may not be.
-            Err(error) if directory == root => return Err(error),
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(file_type) if file_type.is_dir() => {
-                    if recursive {
-                        directories.push(path);
-                    }
-                }
-                Ok(file_type) if file_type.is_file() => files.push(path),
-                // Follows symlinks, so a link to a video counts as one.
-                _ if path.is_file() => files.push(path),
-                _ => {}
-            }
-        }
-    }
-    Ok(files)
-}
-
 fn create_plan(
     root: PathBuf,
-    mut videos_by_directory: HashMap<PathBuf, Vec<Candidate>>,
-    mut subtitles_by_directory: HashMap<PathBuf, Vec<Candidate>>,
+    mut groups: Vec<Group>,
     options: &PlanOptions,
-    path_exists: &dyn Fn(&Path) -> bool,
+    path_exists: &(dyn Fn(&Path) -> bool + Sync),
 ) -> RenamePlan {
-    for candidates in videos_by_directory
-        .values_mut()
-        .chain(subtitles_by_directory.values_mut())
-    {
-        candidates.sort_by_cached_key(|candidate| sort_key(&candidate.path));
-    }
+    groups.sort_by_cached_key(|group| sort_key(&group.directory));
 
-    let mut directories: Vec<PathBuf> = videos_by_directory
-        .keys()
-        .chain(subtitles_by_directory.keys())
-        .cloned()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    directories.sort_by_cached_key(|directory| sort_key(directory));
+    let video_count = groups.iter().map(|group| group.videos.len()).sum();
+    let subtitle_count = groups.iter().map(|group| group.subtitles.len()).sum();
 
-    let video_count = videos_by_directory.values().map(Vec::len).sum();
-    let subtitle_count = subtitles_by_directory.values().map(Vec::len).sum();
+    // Folders are independent, so they are planned at once and stitched back
+    // together in the sorted order above.
+    // With enough folders the threads go here; with only a few, they go inside
+    // a folder instead, so one enormous flat directory is not left to a single
+    // core. Nesting both would just oversubscribe the machine.
+    let spread_within = crate::parallel::worker_count(groups.len()) <= 1;
+    let per_directory = crate::parallel::map(&groups, |group| {
+        build_directory_plan(
+            &ordered(&group.subtitles),
+            &ordered(&group.videos),
+            options,
+            path_exists,
+            spread_within,
+        )
+    });
 
     let mut operations = Vec::new();
     let mut skipped = Vec::new();
-    for directory in &directories {
-        let subtitles = subtitles_by_directory
-            .get(directory)
-            .map_or(&[][..], Vec::as_slice);
-        if subtitles.is_empty() {
-            continue;
-        }
-        let videos = videos_by_directory
-            .get(directory)
-            .map_or(&[][..], Vec::as_slice);
-        if videos.is_empty() {
-            skipped.extend(subtitles.iter().map(|subtitle| SkippedRename {
-                path: subtitle.path.clone(),
-                reason: SkipReason::NoVideo,
-            }));
-            continue;
-        }
-        build_directory_plan(
-            subtitles,
-            videos,
-            options,
-            path_exists,
-            &mut operations,
-            &mut skipped,
-        );
+    for (directory_operations, directory_skipped) in per_directory {
+        operations.extend(directory_operations);
+        skipped.extend(directory_skipped);
     }
 
     RenamePlan {
@@ -337,14 +470,27 @@ fn create_plan(
     }
 }
 
+/// Decide every rename inside one folder.
 fn build_directory_plan(
-    subtitles: &[Candidate],
-    videos: &[Candidate],
+    subtitles: &[&Candidate],
+    videos: &[&Candidate],
     options: &PlanOptions,
-    path_exists: &dyn Fn(&Path) -> bool,
-    operations: &mut Vec<RenameOp>,
-    skipped: &mut Vec<SkippedRename>,
-) {
+    path_exists: &(dyn Fn(&Path) -> bool + Sync),
+    spread_within: bool,
+) -> (Vec<RenameOp>, Vec<SkippedRename>) {
+    let mut operations = Vec::new();
+    let mut skipped = Vec::new();
+    if subtitles.is_empty() {
+        return (operations, skipped);
+    }
+    if videos.is_empty() {
+        skipped.extend(subtitles.iter().map(|subtitle| SkippedRename {
+            path: subtitle.path.clone(),
+            reason: SkipReason::NoVideo,
+        }));
+        return (operations, skipped);
+    }
+
     // An episode id shared by two videos identifies neither, so both drop out of
     // the index and any subtitle carrying that id is reported as ambiguous.
     let mut videos_by_episode: HashMap<&str, &Candidate> = HashMap::new();
@@ -353,7 +499,7 @@ fn build_directory_plan(
         let Some(key) = video.episode_key.as_deref() else {
             continue;
         };
-        if videos_by_episode.insert(key, video).is_some() {
+        if videos_by_episode.insert(key, *video).is_some() {
             ambiguous.insert(key);
         }
     }
@@ -361,41 +507,42 @@ fn build_directory_plan(
         videos_by_episode.remove(key);
     }
 
-    let mut planned: HashSet<PathBuf> = HashSet::new();
+    // Which video a subtitle belongs to depends on nothing but the folder, so
+    // every subtitle is decided at once. Where it then *goes* does depend on the
+    // subtitles before it, and stays in order below.
+    let targets = fuzzy_index(subtitles, videos, spread_within);
+    let decide = |scratch: &mut Scratch, subtitle: &&Candidate| {
+        match_subtitle(
+            subtitle,
+            videos,
+            &videos_by_episode,
+            &ambiguous,
+            &targets,
+            options,
+            scratch,
+        )
+    };
+    let matches = if spread_within {
+        crate::parallel::map_with(subtitles, Scratch::default, decide)
+    } else {
+        let mut scratch = Scratch::default();
+        subtitles
+            .iter()
+            .map(|subtitle| decide(&mut scratch, subtitle))
+            .collect()
+    };
 
-    for subtitle in subtitles {
-        let episode = subtitle.episode_key.as_deref();
-        if let Some(key) = episode {
-            if ambiguous.contains(key) {
+    let mut planned: HashSet<PathBuf> = HashSet::new();
+    for (subtitle, matched) in subtitles.iter().zip(matches) {
+        let (video, reason) = match matched {
+            Ok(matched) => matched,
+            Err(reason) => {
                 skipped.push(SkippedRename {
                     path: subtitle.path.clone(),
-                    reason: SkipReason::AmbiguousEpisode(key.to_string()),
+                    reason,
                 });
                 continue;
             }
-        }
-
-        let (video, reason) = match episode {
-            Some(key) => match videos_by_episode.get(key) {
-                Some(video) => (*video, MatchReason::Episode(key.to_string())),
-                None => {
-                    skipped.push(SkippedRename {
-                        path: subtitle.path.clone(),
-                        reason: SkipReason::NoMatchingEpisode(key.to_string()),
-                    });
-                    continue;
-                }
-            },
-            None => match choose_unique_best(subtitle, videos, options.min_score) {
-                (Some(video), score) => (video, MatchReason::Fuzzy(score)),
-                (None, best_score) => {
-                    skipped.push(SkippedRename {
-                        path: subtitle.path.clone(),
-                        reason: SkipReason::Unmatched { best_score },
-                    });
-                    continue;
-                }
-            },
         };
 
         let Some(destination) = choose_destination(
@@ -432,6 +579,8 @@ fn build_directory_plan(
             reason,
         });
     }
+
+    (operations, skipped)
 }
 
 /// Work out where a subtitle should go, or `None` if every name is taken.
@@ -444,7 +593,7 @@ fn choose_destination(
     video: &Candidate,
     strict: bool,
     overwrite_existing: bool,
-    path_exists: &dyn Fn(&Path) -> bool,
+    path_exists: &(dyn Fn(&Path) -> bool + Sync),
     planned: &HashSet<PathBuf>,
 ) -> Option<PathBuf> {
     let extension = subtitle
@@ -488,23 +637,78 @@ fn choose_destination(
     None
 }
 
+/// Index every video stem for fuzzy matching, once per folder.
+///
+/// Skipped entirely when every subtitle in the folder settles on an episode id,
+/// which is the common case for a tidy library.
+fn fuzzy_index(subtitles: &[&Candidate], videos: &[&Candidate], spread: bool) -> Vec<Target> {
+    let wanted = subtitles
+        .iter()
+        .any(|subtitle| subtitle.episode_key.is_none());
+    if !wanted {
+        return Vec::new();
+    }
+    let build = |video: &&Candidate| Target::new(&video.stem_norm);
+    if spread {
+        crate::parallel::map(videos, build)
+    } else {
+        videos.iter().map(build).collect()
+    }
+}
+
+/// Work out which video a subtitle belongs to, or why it is being left alone.
+fn match_subtitle<'a>(
+    subtitle: &Candidate,
+    videos: &[&'a Candidate],
+    videos_by_episode: &HashMap<&str, &'a Candidate>,
+    ambiguous: &HashSet<&str>,
+    targets: &[Target],
+    options: &PlanOptions,
+    scratch: &mut Scratch,
+) -> Result<(&'a Candidate, MatchReason), SkipReason> {
+    let Some(key) = subtitle.episode_key.as_deref() else {
+        return match choose_unique_best(subtitle, videos, targets, options.min_score, scratch) {
+            (Some(video), score) => Ok((video, MatchReason::Fuzzy(score))),
+            (None, best_score) => Err(SkipReason::Unmatched { best_score }),
+        };
+    };
+    if ambiguous.contains(key) {
+        return Err(SkipReason::AmbiguousEpisode(key.to_string()));
+    }
+    match videos_by_episode.get(key) {
+        Some(video) => Ok((*video, MatchReason::Episode(key.to_string()))),
+        None => Err(SkipReason::NoMatchingEpisode(key.to_string())),
+    }
+}
+
 /// Pick the one video that clearly fits `subtitle`, with its score.
 ///
 /// Returns the best score even when nothing is chosen, so the preview can show
 /// how close the near miss was.
 fn choose_unique_best<'a>(
     subtitle: &Candidate,
-    videos: &'a [Candidate],
+    videos: &[&'a Candidate],
+    targets: &[Target],
     min_score: f64,
+    scratch: &mut Scratch,
 ) -> (Option<&'a Candidate>, f64) {
     if subtitle.stem_norm.is_empty() {
         return (None, 0.0);
     }
+    let counts = CharCounts::new(&subtitle.stem_norm);
 
-    let mut best = None;
+    let mut best: Option<(f64, &Candidate)> = None;
     let mut runner_up = 0.0;
-    for video in videos.iter().filter(|video| !video.stem_norm.is_empty()) {
-        let score = ratio(&subtitle.stem_norm, &video.stem_norm);
+    for (video, target) in videos.iter().copied().zip(targets) {
+        if target.is_empty() {
+            continue;
+        }
+        // A video that cannot reach the runner-up even in the best case can
+        // change neither the winner nor the margin, so it is not scored.
+        if target.ratio_bound(&counts) <= runner_up {
+            continue;
+        }
+        let score = target.ratio(&subtitle.stem_norm, scratch);
         match best {
             Some((best_score, _)) if score > best_score => {
                 runner_up = best_score;
@@ -789,5 +993,61 @@ mod tests {
         assert_eq!(deep.video_count, 2);
         // The nested subtitle already matches, so only the top-level one moves.
         assert_eq!(deep.operations.len(), 1);
+    }
+
+    /// Wide enough that the scan runs on several threads, which must not change
+    /// what is found or the order it comes back in.
+    #[test]
+    fn a_wide_recursive_scan_finds_every_folder_in_a_stable_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        for show in 0..40 {
+            let directory = root.join(format!("show{show:02}/season01"));
+            std::fs::create_dir_all(&directory).unwrap();
+            for episode in 1..=4 {
+                std::fs::write(
+                    directory.join(format!("Nebula.S01E{episode:02}.1080p.mkv")),
+                    b"",
+                )
+                .unwrap();
+                std::fs::write(
+                    directory.join(format!("Other.Release.S01E{episode:02}.chs.srt")),
+                    b"",
+                )
+                .unwrap();
+            }
+        }
+
+        let options = PlanOptions {
+            recursive: true,
+            ..PlanOptions::default()
+        };
+        let plan = plan_directory(root, &options).unwrap();
+        assert_eq!(plan.video_count, 160);
+        assert_eq!(plan.subtitle_count, 160);
+        assert_eq!(plan.operations.len(), 160);
+
+        let sources: Vec<PathBuf> = plan
+            .operations
+            .iter()
+            .map(|operation| operation.source.clone())
+            .collect();
+        let mut sorted = sources.clone();
+        sorted.sort_by_cached_key(|path| sort_key(path));
+        assert_eq!(sources, sorted);
+
+        // And again: two runs of the same tree must agree exactly.
+        let again = plan_directory(root, &options).unwrap();
+        assert_eq!(
+            again
+                .operations
+                .iter()
+                .map(|operation| operation.destination.clone())
+                .collect::<Vec<_>>(),
+            plan.operations
+                .iter()
+                .map(|operation| operation.destination.clone())
+                .collect::<Vec<_>>()
+        );
     }
 }
