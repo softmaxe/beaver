@@ -602,12 +602,9 @@ fn choose_destination(
     path_exists: &(dyn Fn(&Path) -> bool + Sync),
     planned: &HashSet<PathBuf>,
 ) -> Option<PathBuf> {
-    let extension = subtitle
-        .path
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())?;
+    let extension = subtitle.path.extension().map(|e| e.to_string_lossy())?;
     let directory = video.path.parent()?;
-    let video_stem = video.path.file_stem()?.to_string_lossy().into_owned();
+    let video_stem = video.path.file_stem()?.to_string_lossy();
 
     // Renaming a file onto its own name is not a collision; the caller reports
     // that case as "already matches".

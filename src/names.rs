@@ -225,10 +225,19 @@ fn ends_on_boundary(characters: &[char], index: usize) -> bool {
 
 fn read_digits(characters: &[char], start: usize, length: usize) -> Option<u32> {
     let slice = characters.get(start..start + length)?;
-    if !slice.iter().all(char::is_ascii_digit) {
+    if slice.is_empty() {
         return None;
     }
-    slice.iter().collect::<String>().parse().ok()
+    let mut value = 0_u32;
+    for character in slice {
+        if !character.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(*character as u32 - '0' as u32)?;
+    }
+    Some(value)
 }
 
 fn skip_separators(characters: &[char], mut index: usize) -> usize {
@@ -252,16 +261,12 @@ pub fn language_tag(stem: &str) -> Option<String> {
     if let Some(pair) = language_pair(&characters) {
         return Some(pair);
     }
-    let tokens: Vec<String> = split_tokens(stem)
-        .iter()
-        .map(|token| token.to_lowercase())
-        .collect();
-    tokens
-        .iter()
+    split_tokens(stem)
+        .into_iter()
         .rev()
         .take(8)
+        .map(|token| token.to_lowercase())
         .find(|token| is_language_tag(token))
-        .cloned()
 }
 
 fn language_pair(characters: &[char]) -> Option<String> {
@@ -351,6 +356,11 @@ mod tests {
         assert_eq!(episode_key("Show.s01.e02.mkv").as_deref(), Some("S01E02"));
         assert_eq!(episode_key("Show.2x01.mkv").as_deref(), Some("S02E01"));
         assert_eq!(episode_key("Show.10x11.mkv").as_deref(), Some("S10E11"));
+    }
+
+    #[test]
+    fn reading_no_digits_is_not_a_number() {
+        assert_eq!(read_digits(&['1'], 0, 0), None);
     }
 
     #[test]
