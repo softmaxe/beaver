@@ -166,3 +166,22 @@ fn rejects_dry_run_and_apply_together() {
     let output = run(temporary.path(), &["--dry-run", "--apply"]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn a_doctored_filename_cannot_rewrite_the_terminal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    fs::write(root.join("Nebula.Archive.S01E01.1080p.mkv"), b"video").unwrap();
+    // The escape sequence would clear the line and redraw a harmless-looking
+    // rename over it, hiding what the user is about to confirm.
+    let doctored = "evil\u{1b}[2K\rNebula.Archive.S01E01.srt";
+    fs::write(root.join(doctored), b"subtitle").unwrap();
+
+    let output = run(root, &["--dry-run"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(!text.contains('\r'), "{text:?}");
+    assert!(text.contains("evil\u{fffd}[2K\u{fffd}Nebula"), "{text:?}");
+}

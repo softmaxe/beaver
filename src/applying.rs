@@ -213,7 +213,10 @@ fn rename(source: &Path, destination: &Path, force: bool) -> Result<(), String> 
     }
     if let Some(parent) = destination.parent() {
         if !parent.exists() {
-            return Err(format!("target folder is gone: {}", parent.display()));
+            return Err(format!(
+                "target folder is gone: {}",
+                crate::paths::display(parent)
+            ));
         }
     }
     fs::rename(source, destination).map_err(|error| error.to_string())

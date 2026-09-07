@@ -116,7 +116,13 @@ pub enum PlanError {
 impl fmt::Display for PlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotADirectory(path) => write!(formatter, "not a directory: {}", path.display()),
+            Self::NotADirectory(path) => {
+                write!(
+                    formatter,
+                    "not a directory: {}",
+                    crate::paths::display(path)
+                )
+            }
             Self::Io(error) => write!(formatter, "{error}"),
         }
     }
