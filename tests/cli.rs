@@ -167,8 +167,11 @@ fn rejects_dry_run_and_apply_together() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+/// Only Unix lets a control character into a filename at all, which is exactly
+/// why an escape sequence can reach the terminal from one.
+#[cfg(unix)]
 #[test]
-fn a_doctored_filename_cannot_rewrite_the_terminal() {
+fn an_escape_sequence_in_a_filename_cannot_rewrite_the_terminal() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     fs::write(root.join("Nebula.Archive.S01E01.1080p.mkv"), b"video").unwrap();
@@ -184,4 +187,25 @@ fn a_doctored_filename_cannot_rewrite_the_terminal() {
     assert!(!text.contains('\u{1b}'), "{text:?}");
     assert!(!text.contains('\r'), "{text:?}");
     assert!(text.contains("evil\u{fffd}[2K\u{fffd}Nebula"), "{text:?}");
+}
+
+/// A bidirectional override is a legal filename character everywhere, so this
+/// half of the defence is worth checking on every platform.
+#[test]
+fn a_bidi_override_in_a_filename_is_shown_as_a_marker() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    fs::write(root.join("Nebula.Archive.S01E01.1080p.mkv"), b"video").unwrap();
+    fs::write(
+        root.join("Nebula.Archive.S01E01.\u{202e}chs.srt"),
+        b"subtitle",
+    )
+    .unwrap();
+
+    let output = run(root, &["--dry-run"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+    assert!(text.contains("\u{fffd}chs.srt"), "{text:?}");
 }
