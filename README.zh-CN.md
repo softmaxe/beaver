@@ -39,7 +39,7 @@ brew install softmaxe/tap/beaver
 版本。目前发布包包括 Linux `x86_64` 和 `aarch64`、macOS `aarch64`，以及 Windows `x86_64` 和
 `aarch64` 版本。解压后把 `beaver` 或 `beaver.exe` 放入 `PATH`。
 
-Release binary 尚未签名，macOS Gatekeeper 或 Windows SmartScreen 可能会显示警告。
+发布的二进制文件尚未签名，macOS Gatekeeper 或 Windows SmartScreen 可能会显示警告。
 
 ### 从源码安装
 
